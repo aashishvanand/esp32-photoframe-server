@@ -22,6 +22,31 @@ type AutoSyncScheduler struct {
 	retryAfter    time.Time
 	lastError     string
 	running       int
+	// warnedUnconfigured keeps the "enabled but not configured" warning to one
+	// line per episode instead of one per timer tick.
+	warnedUnconfigured bool
+}
+
+// warnUnconfigured logs that an enabled auto-sync has nothing it can sync,
+// once per episode — it re-arms via noteConfigured once the user fixes it.
+// Both places that skip a run call this, so the silent 24h fallback that hid
+// issue #54 for a release always leaves a trace in the log.
+func (s *AutoSyncScheduler) warnUnconfigured() {
+	s.stateMu.Lock()
+	already := s.warnedUnconfigured
+	s.warnedUnconfigured = true
+	s.stateMu.Unlock()
+	if !already {
+		log.Printf("%s auto-sync is enabled but not configured "+
+			"(no album selected?); skipping until that changes", s.name)
+	}
+}
+
+// noteConfigured re-arms the warning so a later misconfiguration is reported.
+func (s *AutoSyncScheduler) noteConfigured() {
+	s.stateMu.Lock()
+	s.warnedUnconfigured = false
+	s.stateMu.Unlock()
 }
 
 // LastError returns the failure message of the most recent completed sync run,
@@ -171,9 +196,14 @@ func (s *AutoSyncScheduler) loop() {
 
 func (s *AutoSyncScheduler) tryRunDue() {
 	enabled, _ := s.getConfig()
-	if !enabled || !s.isConfigured() {
+	if !enabled {
 		return
 	}
+	if !s.isConfigured() {
+		s.warnUnconfigured()
+		return
+	}
+	s.noteConfigured()
 
 	if err := s.SyncNow(); err != nil {
 		log.Printf("%s auto-sync failed: %v", s.name, err)
@@ -185,9 +215,17 @@ func (s *AutoSyncScheduler) tryRunDue() {
 
 func (s *AutoSyncScheduler) nextDelay() time.Duration {
 	enabled, interval := s.getConfig()
-	if !enabled || !s.isConfigured() {
+	if !enabled {
 		return 24 * time.Hour
 	}
+	if !s.isConfigured() {
+		// Reached at startup and on every reset, so this is where a
+		// misconfigured source actually gets reported; tryRunDue would only
+		// notice once the 24h fallback timer finally expired.
+		s.warnUnconfigured()
+		return 24 * time.Hour
+	}
+	s.noteConfigured()
 
 	now := time.Now()
 	s.stateMu.Lock()

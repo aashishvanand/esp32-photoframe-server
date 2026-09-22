@@ -213,6 +213,25 @@ func upsertAlbumAssets(db *gorm.DB, source string, albumID uint, assets []Remote
 	return newCount, memberCount, nil
 }
 
+// countAlbums returns how many album rows exist for a source and how many of
+// them are sync-enabled. Callers use the pair to tell "the album picker has
+// never been used here" (total == 0, fall back to the legacy single-album
+// settings) from "the picker is in use and everything is deselected"
+// (total > 0, enabled == 0).
+func countAlbums(db *gorm.DB, source string) (total, enabled int64) {
+	if err := db.Model(&model.Album{}).Where("source = ?", source).
+		Count(&total).Error; err != nil {
+		log.Printf("%s: count albums: %v", source, err)
+		return 0, 0
+	}
+	if err := db.Model(&model.Album{}).Where("source = ? AND sync_enabled = ?", source, true).
+		Count(&enabled).Error; err != nil {
+		log.Printf("%s: count sync-enabled albums: %v", source, err)
+		return total, 0
+	}
+	return total, enabled
+}
+
 // SetSyncAlbums marks the given albums sync-enabled (creating rows as needed) and
 // disables every other REAL album for the source. Virtual albums (e.g. Immich
 // all/favorites/memories) are left untouched -- the caller manages those. Shared

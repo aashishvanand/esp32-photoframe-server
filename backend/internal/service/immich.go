@@ -92,6 +92,16 @@ func (s *ImmichService) isAutoSyncConfigured() bool {
 	if baseURL == "" || apiKey == "" {
 		return false
 	}
+	// The multi-album picker owns the selection once it has written any row
+	// (a real album, or one of the virtual all/favorites/memories toggles).
+	// It never touches immich_source_mode/immich_album_id, so consulting
+	// those first left every picker-only setup looking unconfigured and
+	// silently skipped auto-sync -- issue #54. The legacy pair below still
+	// speaks for installs that predate the picker, which is exactly the
+	// "no album rows yet" case ensureGlobalAlbumSeed migrates from.
+	if total, enabled := countAlbums(s.db, model.SourceImmich); total > 0 {
+		return enabled > 0
+	}
 	// Album mode is the only one that needs an album picked.
 	if s.immichSourceMode() == ImmichModeAlbum {
 		albumID, _ := s.settings.Get("immich_album_id")
@@ -216,6 +226,12 @@ func (s *ImmichService) SetSyncAlbums(realIDs []string, favorites, all, memories
 	// re-check plus resync re-imports them.
 	pruneDisabledAlbumMemberships(s.db, model.SourceImmich)
 	gcOrphanImagesForSource(s.db, model.SourceImmich)
+
+	// The scheduler only re-arms on a settings change, and the picker writes
+	// album rows rather than settings -- so without this nudge a selection
+	// made while the timer sits on its 24h "not configured" delay wouldn't be
+	// picked up until the next restart (issue #54).
+	s.autoSync.TriggerReset()
 
 	// Persist the selection only — do NOT import here. The import is triggered
 	// explicitly (manual Sync) or by the auto-sync scheduler, so toggling

@@ -70,8 +70,19 @@ func (s *SynologyService) isAutoSyncConfigured() bool {
 	baseURL, _ := s.settings.Get("synology_url")
 	account, _ := s.settings.Get("synology_account")
 	password, _ := s.settings.Get("synology_password")
+	if baseURL == "" || account == "" || password == "" {
+		return false
+	}
+	// As with Immich (issue #54): the album picker writes album rows and
+	// never synology_album_id, so gating on that setting alone left every
+	// picker-only setup silently skipping auto-sync. The legacy setting only
+	// still speaks for installs with no album rows yet -- the same case
+	// ensureGlobalAlbumSeed migrates from.
+	if total, enabled := countAlbums(s.db, model.SourceSynologyPhotos); total > 0 {
+		return enabled > 0
+	}
 	albumID, _ := s.settings.Get("synology_album_id")
-	return baseURL != "" && account != "" && password != "" && albumID != ""
+	return albumID != ""
 }
 
 func (s *SynologyService) getAutoSyncConfig() (bool, time.Duration) {
@@ -528,7 +539,13 @@ func (s *SynologyService) SetSyncAlbums(realIDs []string) error {
 		}
 		albums = append(albums, RemoteAlbum{ExternalID: id, Name: name})
 	}
-	return SetSyncAlbums(s.db, model.SourceSynologyPhotos, albums)
+	if err := SetSyncAlbums(s.db, model.SourceSynologyPhotos, albums); err != nil {
+		return err
+	}
+	// Re-arm the scheduler: it only resets on a settings change, and the
+	// picker writes album rows instead (issue #54).
+	s.autoSync.TriggerReset()
+	return nil
 }
 
 // ClearPhotos deletes all Synology photos and their album memberships.
