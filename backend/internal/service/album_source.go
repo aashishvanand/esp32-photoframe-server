@@ -31,6 +31,7 @@ type RemoteAsset struct {
 type RemoteAlbum struct {
 	ExternalID string
 	Name       string
+	Passphrase string // optional (synology shared-album access token)
 }
 
 // AlbumSource syncs remote albums of assets into the local DB. The shared engine
@@ -72,17 +73,29 @@ func SyncAlbumSource(db *gorm.DB, src AlbumSource) (int, error) {
 		return 0, nil
 	}
 
-	// Best-effort name refresh for real albums.
-	nameByExternalID := map[string]string{}
+	// Best-effort metadata refresh for real albums: the name for display, and
+	// the Synology share passphrase, which DSM can rotate — a stale one would
+	// otherwise fail every future fetch of that album with no way back.
+	remoteByExternalID := map[string]RemoteAlbum{}
 	if list, e := src.ListRemoteAlbums(); e == nil {
 		for _, a := range list {
-			nameByExternalID[a.ExternalID] = a.Name
+			remoteByExternalID[a.ExternalID] = a
 		}
 	}
 
 	total := 0
 	var failures []string
 	for _, album := range albums {
+		remote := remoteByExternalID[album.ExternalID]
+		if album.Kind == model.AlbumKindReal && remote.Passphrase != "" &&
+			remote.Passphrase != album.SharePassphrase {
+			album.SharePassphrase = remote.Passphrase
+			if e := db.Model(&model.Album{}).Where("id = ?", album.ID).
+				Update("share_passphrase", remote.Passphrase).Error; e != nil {
+				log.Printf("%s: update album %d passphrase: %v", source, album.ID, e)
+			}
+		}
+
 		assets, err := src.FetchAlbumAssets(album)
 		if err != nil {
 			log.Printf("%s: fetch album %q (%s) failed: %v", source, album.Name, album.ExternalID, err)
@@ -98,10 +111,8 @@ func SyncAlbumSource(db *gorm.DB, src AlbumSource) (int, error) {
 		total += newCount
 
 		updates := map[string]interface{}{"updated_at": time.Now()}
-		if album.Kind == model.AlbumKindReal {
-			if n := nameByExternalID[album.ExternalID]; n != "" {
-				updates["name"] = n
-			}
+		if album.Kind == model.AlbumKindReal && remote.Name != "" {
+			updates["name"] = remote.Name
 		}
 		if err := db.Model(&model.Album{}).Where("id = ?", album.ID).Updates(updates).Error; err != nil {
 			log.Printf("%s: update album %d (%q): %v", source, album.ID, album.Name, err)
@@ -248,11 +259,12 @@ func SetSyncAlbums(db *gorm.DB, source string, albums []RemoteAlbum) error {
 			switch {
 			case err == gorm.ErrRecordNotFound:
 				if e := tx.Create(&model.Album{
-					Source:      source,
-					ExternalID:  a.ExternalID,
-					Name:        a.Name,
-					Kind:        model.AlbumKindReal,
-					SyncEnabled: true,
+					Source:          source,
+					ExternalID:      a.ExternalID,
+					Name:            a.Name,
+					Kind:            model.AlbumKindReal,
+					SyncEnabled:     true,
+					SharePassphrase: a.Passphrase,
 				}).Error; e != nil {
 					return e
 				}
@@ -260,6 +272,12 @@ func SetSyncAlbums(db *gorm.DB, source string, albums []RemoteAlbum) error {
 				updates := map[string]interface{}{"sync_enabled": true}
 				if a.Name != "" {
 					updates["name"] = a.Name
+				}
+				// Only overwrite a stored passphrase with a real one: sources
+				// without passphrases pass "", and so does Synology when the
+				// NAS was unreachable while the user saved the selection.
+				if a.Passphrase != "" {
+					updates["share_passphrase"] = a.Passphrase
 				}
 				if e := tx.Model(&model.Album{}).Where("id = ?", existing.ID).
 					Updates(updates).Error; e != nil {

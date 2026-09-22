@@ -180,7 +180,49 @@ func (c *Client) ListAlbums(offset, limit int) ([]Album, error) {
 	return result.Data.List, nil
 }
 
-func (c *Client) ListPhotos(offset, limit int, albumID int) ([]Item, error) {
+// ListSharedWithMeAlbums returns the albums other DSM users have shared with
+// the logged-in account. SYNO.Foto.Browse.Album lists only albums the account
+// owns, which left shared albums invisible to the album picker — issue #52.
+func (c *Client) ListSharedWithMeAlbums(offset, limit int) ([]Album, error) {
+	endpoint := fmt.Sprintf("%s/webapi/entry.cgi", c.BaseURL)
+	params := url.Values{}
+	params.Set("api", "SYNO.Foto.Sharing.Misc")
+	params.Set("version", "1")
+	params.Set("method", "list_shared_with_me")
+	params.Set("offset", fmt.Sprintf("%d", offset))
+	params.Set("limit", fmt.Sprintf("%d", limit))
+	if c.SynoToken != "" {
+		params.Set("SynoToken", c.SynoToken)
+	}
+
+	req, err := http.NewRequest("GET", endpoint+"?"+params.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("api returned status: %d", resp.StatusCode)
+	}
+
+	var result BrowseAlbumResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	if !result.Success {
+		return nil, fmt.Errorf("api call failed with code: %d", result.Error.Code)
+	}
+
+	return result.Data.List, nil
+}
+
+func (c *Client) ListPhotos(offset, limit int, album AlbumRef) ([]Item, error) {
 	endpoint := fmt.Sprintf("%s/webapi/entry.cgi", c.BaseURL)
 	params := url.Values{}
 	params.Set("api", "SYNO.Foto.Browse.Item")
@@ -190,8 +232,12 @@ func (c *Client) ListPhotos(offset, limit int, albumID int) ([]Item, error) {
 	params.Set("offset", fmt.Sprintf("%d", offset))
 	params.Set("limit", fmt.Sprintf("%d", limit))
 	params.Set("additional", `["thumbnail","resolution"]`)
-	if albumID != 0 {
-		params.Set("album_id", fmt.Sprintf("%d", albumID))
+	if album.ID != 0 {
+		params.Set("album_id", fmt.Sprintf("%d", album.ID))
+	}
+	// Shared albums are browsed through the passphrase DSM issued for them.
+	if album.Passphrase != "" {
+		params.Set("passphrase", album.Passphrase)
 	}
 	if c.SynoToken != "" {
 		params.Set("SynoToken", c.SynoToken)
@@ -226,7 +272,7 @@ func (c *Client) ListPhotos(offset, limit int, albumID int) ([]Item, error) {
 
 // GetPhoto fetches a thumbnail
 // size: "small", "medium", "large"
-func (c *Client) GetPhoto(id int, cacheKey string, size string, albumID int, synoToken string) ([]byte, error) {
+func (c *Client) GetPhoto(id int, cacheKey string, size string, album AlbumRef, synoToken string) ([]byte, error) {
 	path := "/webapi/entry.cgi"
 	fullURL, _ := url.JoinPath(c.BaseURL, path)
 
@@ -251,8 +297,12 @@ func (c *Client) GetPhoto(id int, cacheKey string, size string, albumID int, syn
 		"type=%22unit%22",
 		fmt.Sprintf("size=%s", url.QueryEscape(fmt.Sprintf("\"%s\"", sz))),
 	}
-	if albumID != 0 {
-		parts = append(parts, fmt.Sprintf("album_id=%d", albumID))
+	if album.ID != 0 {
+		parts = append(parts, fmt.Sprintf("album_id=%d", album.ID))
+	}
+	if album.Passphrase != "" {
+		parts = append(parts, fmt.Sprintf("passphrase=%s",
+			url.QueryEscape(fmt.Sprintf("\"%s\"", album.Passphrase))))
 	}
 	parts = append(parts,
 		fmt.Sprintf("api=%s", url.QueryEscape(fmt.Sprintf("\"%s\"", api))),

@@ -323,13 +323,16 @@
                     </div>
                     <div class="text-caption text-grey mb-2">
                       Choose which Synology Photos albums to pull photos from.
-                      Saving replaces the entire sync set.
+                      Albums other DSM users shared with this account are listed
+                      too. Saving replaces the entire sync set.
                     </div>
 
                     <AlbumPicker
                       v-model="synologySyncAlbumIds"
                       :albums="synologyStore.albums"
                       label-field="name"
+                      badge-field="shared_with_me"
+                      badge-text="Shared with me"
                       stringify
                       empty-text='No albums found. Click "Refresh albums" to load them from Synology.'
                     ></AlbumPicker>

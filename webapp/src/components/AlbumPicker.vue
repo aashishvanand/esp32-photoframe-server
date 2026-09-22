@@ -19,15 +19,24 @@
       <slot name="prepend"></slot>
       <v-divider v-if="hasPrepend && albums.length"></v-divider>
       <v-list-item v-for="album in filtered" :key="album.id">
-        <v-checkbox
-          :model-value="modelValue.includes(valueOf(album))"
-          :label="album[labelField]"
-          :disabled="disabled"
-          color="primary"
-          density="compact"
-          hide-details
-          @update:model-value="toggle(album, $event)"
-        ></v-checkbox>
+        <div class="d-flex align-center ga-2">
+          <v-checkbox
+            :model-value="modelValue.includes(valueOf(album))"
+            :label="album[labelField]"
+            :disabled="disabled"
+            color="primary"
+            density="compact"
+            hide-details
+            @update:model-value="toggle(album, $event)"
+          ></v-checkbox>
+          <v-chip
+            v-if="badgeField && album[badgeField]"
+            size="x-small"
+            variant="tonal"
+            color="primary"
+            >{{ badgeText }}</v-chip
+          >
+        </div>
       </v-list-item>
       <v-list-item v-if="!albums.length" class="text-caption text-grey">
         {{ emptyText }}
@@ -53,12 +62,19 @@ const props = withDefaults(
     disabled?: boolean;
     emptyText?: string;
     maxHeight?: number;
+    // Optional flag field on an album; when truthy the row gets a badgeText
+    // chip. Used to mark Synology albums shared with (not owned by) the
+    // account, which can otherwise be indistinguishable by name.
+    badgeField?: string;
+    badgeText?: string;
   }>(),
   {
     stringify: false,
     disabled: false,
     emptyText: 'No albums found.',
     maxHeight: 320,
+    badgeField: '',
+    badgeText: '',
   }
 );
 const emit = defineEmits<{ 'update:modelValue': [(string | number)[]] }>();

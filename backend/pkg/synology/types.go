@@ -46,4 +46,19 @@ type Album struct {
 	ID   int    `json:"id"`
 	Name string `json:"name"`
 	Type string `json:"type"` // "folder" or "album"
+	// Passphrase is returned for albums shared with the logged-in user and is
+	// required to browse them; empty for albums the user owns.
+	Passphrase string `json:"passphrase"`
+	// SharedWithMe is set by the server (not DSM) so the UI can tell an album
+	// someone shared with this account from one it owns — the two can have
+	// the same name.
+	SharedWithMe bool `json:"shared_with_me"`
+}
+
+// AlbumRef identifies an album to browse: its numeric id plus, for albums
+// shared with the logged-in user, the passphrase that grants access. The zero
+// value means "not scoped to an album".
+type AlbumRef struct {
+	ID         int
+	Passphrase string
 }

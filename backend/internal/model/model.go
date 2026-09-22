@@ -161,15 +161,18 @@ const (
 // memories) use the ImmichVirtual* sentinels. SyncEnabled marks albums the
 // server pulls assets for.
 type Album struct {
-	ID          uint      `gorm:"primaryKey" json:"id"`
-	Source      string    `gorm:"uniqueIndex:idx_albums_source_external,priority:1" json:"source"`
-	ExternalID  string    `gorm:"uniqueIndex:idx_albums_source_external,priority:2" json:"external_id"`
-	Name        string    `json:"name"`
-	Kind        string    `json:"kind"` // "album" | "virtual"
-	SyncEnabled bool      `json:"sync_enabled"`
-	AssetCount  int       `gorm:"-" json:"asset_count"` // computed live in ListAlbums; not stored
-	CoverKey    string    `json:"cover_key"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID          uint   `gorm:"primaryKey" json:"id"`
+	Source      string `gorm:"uniqueIndex:idx_albums_source_external,priority:1" json:"source"`
+	ExternalID  string `gorm:"uniqueIndex:idx_albums_source_external,priority:2" json:"external_id"`
+	Name        string `json:"name"`
+	Kind        string `json:"kind"` // "album" | "virtual"
+	SyncEnabled bool   `json:"sync_enabled"`
+	// SharePassphrase grants access to a Synology album shared with (not owned
+	// by) the logged-in account. Empty for owned albums and other sources.
+	SharePassphrase string    `json:"-"`
+	AssetCount      int       `gorm:"-" json:"asset_count"` // computed live in ListAlbums; not stored
+	CoverKey        string    `json:"cover_key"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // ImageAlbumMembership is the many-to-many link between an image (asset) and

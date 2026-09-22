@@ -194,50 +194,56 @@ func (s *SynologyService) GetPhoto(id int, cacheKeyStr, size string) ([]byte, er
 	if err := s.db.Where("external_id = ? AND source = ?", strconv.Itoa(id), model.SourceSynologyPhotos).First(&img).Error; err != nil {
 		// Fallback if not found in DB
 		gen := s.loginGeneration()
-		data, getErr := s.client.GetPhoto(id, cacheKeyStr, size, 0, s.client.SynoToken)
+		data, getErr := s.client.GetPhoto(id, cacheKeyStr, size, synology.AlbumRef{}, s.client.SynoToken)
 		if s.isAuthExpired(getErr) {
 			if reErr := s.relogin(gen); reErr != nil {
 				return nil, reErr
 			}
-			return s.client.GetPhoto(id, cacheKeyStr, size, 0, s.client.SynoToken)
+			return s.client.GetPhoto(id, cacheKeyStr, size, synology.AlbumRef{}, s.client.SynoToken)
 		}
 		return data, getErr
 	}
 
 	// 2. Resolve the album for this photo (membership first, then the legacy
-	// global setting) so multi-album photos are fetched with the right album.
-	albumID := s.albumIDForImage(img.ID)
+	// global setting) so multi-album photos are fetched with the right album,
+	// and shared albums with the passphrase that grants access.
+	ref := s.albumRefForImage(img.ID)
 
 	gen := s.loginGeneration()
-	data, err := s.client.GetPhoto(id, img.ThumbnailKey, size, albumID, s.client.SynoToken)
+	data, err := s.client.GetPhoto(id, img.ThumbnailKey, size, ref, s.client.SynoToken)
 	if s.isAuthExpired(err) {
 		if reErr := s.relogin(gen); reErr != nil {
 			return nil, reErr
 		}
-		return s.client.GetPhoto(id, img.ThumbnailKey, size, albumID, s.client.SynoToken)
+		return s.client.GetPhoto(id, img.ThumbnailKey, size, ref, s.client.SynoToken)
 	}
 	return data, err
 }
 
-// albumIDForImage returns a Synology album external id (int) the image belongs
-// to via membership, falling back to the legacy global setting, else 0.
-func (s *SynologyService) albumIDForImage(imageID uint) int {
-	var ext string
+// albumRefForImage returns the Synology album the image belongs to via
+// membership — its id plus, for a shared album, the passphrase needed to read
+// it — falling back to the legacy global setting, else the zero ref.
+func (s *SynologyService) albumRefForImage(imageID uint) synology.AlbumRef {
+	var row struct {
+		ExternalID      string
+		SharePassphrase string
+	}
 	s.db.Model(&model.ImageAlbumMembership{}).
+		Select("albums.external_id, albums.share_passphrase").
 		Joins("JOIN albums ON albums.id = image_album_memberships.album_id").
 		Where("image_album_memberships.image_id = ? AND albums.source = ?", imageID, model.SourceSynologyPhotos).
-		Limit(1).Pluck("albums.external_id", &ext)
-	if ext != "" {
-		if n, err := strconv.Atoi(ext); err == nil {
-			return n
+		Limit(1).Scan(&row)
+	if row.ExternalID != "" {
+		if n, err := strconv.Atoi(row.ExternalID); err == nil {
+			return synology.AlbumRef{ID: n, Passphrase: row.SharePassphrase}
 		}
 	}
 	if g, _ := s.settings.Get("synology_album_id"); g != "" {
 		if n, err := strconv.Atoi(g); err == nil {
-			return n
+			return synology.AlbumRef{ID: n}
 		}
 	}
-	return 0
+	return synology.AlbumRef{}
 }
 
 // loginGeneration returns the current successful-login counter. Callers
@@ -289,11 +295,51 @@ func (s *SynologyService) ListAlbums() ([]synology.Album, error) {
 		return nil, err
 	}
 
+	albums = append(albums, s.listSharedAlbums(albums)...)
+
 	// Cache the albums list
 	albumsJSON, _ := json.Marshal(albums)
 	s.settings.Set("synology_albums_cache", string(albumsJSON))
 
 	return albums, nil
+}
+
+// listSharedAlbums returns the albums shared with the logged-in account that
+// aren't already in owned. Best-effort: a DSM that doesn't serve
+// SYNO.Foto.Sharing.Misc (or an account with nothing shared to it) must still
+// get its owned albums, so a failure here is logged and swallowed rather than
+// failing the whole listing. See issue #52.
+func (s *SynologyService) listSharedAlbums(owned []synology.Album) []synology.Album {
+	gen := s.loginGeneration()
+	shared, err := s.client.ListSharedWithMeAlbums(0, 100)
+	if s.isAuthExpired(err) {
+		if reErr := s.relogin(gen); reErr != nil {
+			log.Printf("synology: re-login while listing shared albums: %v", reErr)
+			return nil
+		}
+		shared, err = s.client.ListSharedWithMeAlbums(0, 100)
+	}
+	if err != nil {
+		log.Printf("synology: could not list shared albums (owned albums still listed): %v", err)
+		return nil
+	}
+
+	seen := make(map[int]bool, len(owned))
+	for _, a := range owned {
+		seen[a.ID] = true
+	}
+	out := make([]synology.Album, 0, len(shared))
+	for _, a := range shared {
+		// An album shared back to its owner would otherwise appear twice.
+		if a.ID == 0 || seen[a.ID] {
+			continue
+		}
+		seen[a.ID] = true
+		a.SharedWithMe = true
+		out = append(out, a)
+	}
+	log.Printf("synology: %d album(s) shared with this account (%d owned)", len(out), len(owned))
+	return out
 }
 
 // Source implements AlbumSource: the model.Source* constant this owns.
@@ -308,7 +354,9 @@ func (s *SynologyService) ListRemoteAlbums() ([]RemoteAlbum, error) {
 	}
 	out := make([]RemoteAlbum, 0, len(albums))
 	for _, a := range albums {
-		out = append(out, RemoteAlbum{ExternalID: strconv.Itoa(a.ID), Name: a.Name})
+		out = append(out, RemoteAlbum{
+			ExternalID: strconv.Itoa(a.ID), Name: a.Name, Passphrase: a.Passphrase,
+		})
 	}
 	return out, nil
 }
@@ -321,18 +369,19 @@ func (s *SynologyService) FetchAlbumAssets(album model.Album) ([]RemoteAsset, er
 	if err != nil {
 		return nil, err
 	}
+	ref := synology.AlbumRef{ID: albumID, Passphrase: album.SharePassphrase}
 
 	// Page through the album over the network.
 	var photos []synology.Item
 	offset, limit := 0, 500
 	for offset < 5000 {
 		gen := s.loginGeneration()
-		batch, e := s.client.ListPhotos(offset, limit, albumID)
+		batch, e := s.client.ListPhotos(offset, limit, ref)
 		if s.isAuthExpired(e) {
 			if reErr := s.relogin(gen); reErr != nil {
 				return nil, reErr
 			}
-			batch, e = s.client.ListPhotos(offset, limit, albumID)
+			batch, e = s.client.ListPhotos(offset, limit, ref)
 		}
 		if e != nil {
 			return nil, e
@@ -350,7 +399,7 @@ func (s *SynologyService) FetchAlbumAssets(album model.Album) ([]RemoteAsset, er
 	// Synology omits resolution for some items (reported as 0x0), which
 	// determineOrientation would misclassify as landscape. Recover the real
 	// orientation by decoding a thumbnail. Runs outside any DB transaction.
-	s.backfillMissingResolutions(photos, albumID)
+	s.backfillMissingResolutions(photos, ref)
 
 	out := make([]RemoteAsset, 0, len(photos))
 	for _, p := range photos {
@@ -403,18 +452,19 @@ func (s *SynologyService) ensureGlobalAlbumSeed() {
 	if ext == "" {
 		return
 	}
-	name := ext
+	name, passphrase := ext, ""
 	if albums, err := s.ListAlbums(); err == nil {
 		for _, a := range albums {
 			if strconv.Itoa(a.ID) == ext {
-				name = a.Name
+				name, passphrase = a.Name, a.Passphrase
 				break
 			}
 		}
 	}
 	album := model.Album{
 		Source: model.SourceSynologyPhotos, ExternalID: ext,
-		Kind: model.AlbumKindReal, Name: name, SyncEnabled: true, UpdatedAt: time.Now(),
+		Kind: model.AlbumKindReal, Name: name, SyncEnabled: true,
+		SharePassphrase: passphrase, UpdatedAt: time.Now(),
 	}
 	if err := s.db.Create(&album).Error; err != nil {
 		log.Printf("Synology: failed to seed global album row: %v", err)
@@ -426,17 +476,17 @@ func (s *SynologyService) ensureGlobalAlbumSeed() {
 // aspect ratio, so this yields the correct orientation (the returned size is the
 // thumbnail's, which is all determineOrientation needs). DecodeConfig reads only
 // the header, so it stays cheap.
-func (s *SynologyService) resolvePhotoDimensions(id int, thumbKey string, albumID int) (int, int, error) {
+func (s *SynologyService) resolvePhotoDimensions(id int, thumbKey string, album synology.AlbumRef) (int, int, error) {
 	if thumbKey == "" {
 		return 0, 0, errors.New("no thumbnail key")
 	}
 	gen := s.loginGeneration()
-	data, err := s.client.GetPhoto(id, thumbKey, "large", albumID, s.client.SynoToken)
+	data, err := s.client.GetPhoto(id, thumbKey, "large", album, s.client.SynoToken)
 	if s.isAuthExpired(err) {
 		if reErr := s.relogin(gen); reErr != nil {
 			return 0, 0, reErr
 		}
-		data, err = s.client.GetPhoto(id, thumbKey, "large", albumID, s.client.SynoToken)
+		data, err = s.client.GetPhoto(id, thumbKey, "large", album, s.client.SynoToken)
 	}
 	if err != nil {
 		return 0, 0, err
@@ -452,7 +502,7 @@ func (s *SynologyService) resolvePhotoDimensions(id int, thumbKey string, albumI
 // without a resolution (0x0) by decoding a thumbnail, mutating photos in place.
 // Runs outside any DB transaction (network I/O). Photos a previous sync already
 // resolved are skipped, so it's a one-time cost per photo.
-func (s *SynologyService) backfillMissingResolutions(photos []synology.Item, albumID int) {
+func (s *SynologyService) backfillMissingResolutions(photos []synology.Item, album synology.AlbumRef) {
 	var needIDs []int
 	for _, p := range photos {
 		if p.Additional.Resolution.Width <= 0 || p.Additional.Resolution.Height <= 0 {
@@ -492,7 +542,7 @@ func (s *SynologyService) backfillMissingResolutions(photos []synology.Item, alb
 		if thumbKey == "" {
 			thumbKey = p.Additional.Thumbnail.XL
 		}
-		w, h, err := s.resolvePhotoDimensions(p.ID, thumbKey, albumID)
+		w, h, err := s.resolvePhotoDimensions(p.ID, thumbKey, album)
 		if err != nil || w <= 0 || h <= 0 {
 			log.Printf("synology: could not decode dimensions for photo %d: %v", p.ID, err)
 			continue
@@ -522,9 +572,11 @@ func (s *SynologyService) backfillMissingResolutions(photos []synology.Item, alb
 // auto-sync scheduler, not on every album toggle.
 func (s *SynologyService) SetSyncAlbums(realIDs []string) error {
 	nameByID := map[string]string{}
+	passphraseByID := map[string]string{}
 	if albums, err := s.ListAlbums(); err == nil {
 		for _, a := range albums {
 			nameByID[strconv.Itoa(a.ID)] = a.Name
+			passphraseByID[strconv.Itoa(a.ID)] = a.Passphrase
 		}
 	}
 
@@ -537,7 +589,9 @@ func (s *SynologyService) SetSyncAlbums(realIDs []string) error {
 		if name == "" {
 			name = id
 		}
-		albums = append(albums, RemoteAlbum{ExternalID: id, Name: name})
+		albums = append(albums, RemoteAlbum{
+			ExternalID: id, Name: name, Passphrase: passphraseByID[id],
+		})
 	}
 	if err := SetSyncAlbums(s.db, model.SourceSynologyPhotos, albums); err != nil {
 		return err
