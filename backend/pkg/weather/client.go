@@ -26,18 +26,40 @@ type HourlyWeather struct {
 	WeatherCode        []int    `json:"weathercode"`
 }
 
+const forecastEndpoint = "https://api.open-meteo.com/v1/forecast"
+
 type Client struct {
 	httpClient *http.Client
+	// endpoint is the forecast URL, overridable so tests can serve canned
+	// responses instead of reaching Open-Meteo.
+	endpoint string
 }
 
 func NewClient() *Client {
-	return &Client{httpClient: &http.Client{}}
+	return &Client{httpClient: &http.Client{}, endpoint: forecastEndpoint}
+}
+
+// hourKey reduces an Open-Meteo "2006-01-02T15:04" timestamp to the hour it
+// falls in. current_weather.time and hourly.time agree on the hour but not
+// always on the minute, so comparisons go through this.
+func hourKey(t string) string {
+	const n = len("2006-01-02T15")
+	if len(t) < n {
+		return ""
+	}
+	return t[:n]
 }
 
 func (c *Client) GetWeather(lat, lon string) (*CurrentWeather, error) {
-	// Request hourly data for precise humidity and weather matching
-	// Request `timezone=auto` so the API returns the correct IANA timezone
-	url := fmt.Sprintf("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current_weather=true&hourly=temperature_2m,relativehumidity_2m,weathercode&forecast_days=1&timezone=auto", lat, lon)
+	endpoint := c.endpoint
+	if endpoint == "" {
+		endpoint = forecastEndpoint
+	}
+	// Request hourly data for precise humidity and weather matching.
+	// timezone=auto: the response's IANA timezone drives the frame's clock,
+	// and the default (GMT) silently renders every frame in UTC because
+	// time.LoadLocation("GMT") succeeds.
+	url := fmt.Sprintf("%s?latitude=%s&longitude=%s&current_weather=true&hourly=temperature_2m,relativehumidity_2m,weathercode&forecast_days=1&timezone=auto", endpoint, lat, lon)
 
 	resp, err := c.httpClient.Get(url)
 	if err != nil {
@@ -55,15 +77,21 @@ func (c *Client) GetWeather(lat, lon string) (*CurrentWeather, error) {
 	}
 
 	// 1. Find the index in hourly data that matches the current weather time
-	// This ensures we get the humidity/icon for the *current* hour, not midnight
-	targetTime := result.Current.Time
+	// This ensures we get the humidity/icon for the *current* hour, not midnight.
+	//
+	// Match on the hour, not the whole string: with timezone=auto the API
+	// reports current_weather.time at the location's real UTC offset, so it
+	// lands on :30 in Asia/Kolkata (+5:30) and :45 in Pacific/Chatham (+12:45)
+	// while hourly.time is always on the hour. An exact comparison misses in
+	// those zones and drops through to the midnight fallback below — the very
+	// thing this block exists to avoid.
+	targetHour := hourKey(result.Current.Time)
 	idx := 0
 	found := false
 
-	// Check if we have hourly times
-	if len(result.Hourly.Time) > 0 {
+	if targetHour != "" {
 		for i, t := range result.Hourly.Time {
-			if t == targetTime {
+			if hourKey(t) == targetHour {
 				idx = i
 				found = true
 				break
