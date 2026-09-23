@@ -1204,7 +1204,7 @@
                         : 'height: 455px; overflow-y: auto'
                     "
                   >
-                    <!-- Add Device: just host input -->
+                    <!-- Add Device: host, plus a password if the frame needs one -->
                     <div v-if="isAddingDevice" class="mt-2">
                       <v-text-field
                         v-model="editingDevice.host"
@@ -1213,6 +1213,25 @@
                         hint="e.g., photoframe.local or 192.168.1.100"
                         persistent-hint
                         autofocus
+                      ></v-text-field>
+                      <v-checkbox
+                        v-model="deviceNeedsPassword"
+                        label="This frame requires a password"
+                        color="primary"
+                        density="compact"
+                        class="mt-2"
+                        hide-details
+                      ></v-checkbox>
+                      <v-text-field
+                        v-if="deviceNeedsPassword"
+                        v-model="deviceHttpPassword"
+                        label="Frame password"
+                        type="password"
+                        maxlength="63"
+                        variant="outlined"
+                        hint="Set on the frame's own web interface. Without it the frame cannot be read, and placeholder settings are used until you supply it."
+                        persistent-hint
+                        class="mt-2"
                       ></v-text-field>
                     </div>
 
@@ -1244,6 +1263,31 @@
                               density="compact"
                               hide-details
                             ></v-text-field>
+                          </v-col>
+                          <v-col cols="12" md="6">
+                            <v-text-field
+                              v-model="deviceHttpPassword"
+                              :label="
+                                editingDevice.http_password_set
+                                  ? 'Frame password (set — blank keeps it)'
+                                  : 'Frame password (only if enabled on the frame)'
+                              "
+                              type="password"
+                              maxlength="63"
+                              variant="outlined"
+                              density="compact"
+                              hint="Needed only when the frame requires a password for its own web interface."
+                              persistent-hint
+                            ></v-text-field>
+                            <v-btn
+                              v-if="editingDevice.http_password_set"
+                              size="small"
+                              variant="text"
+                              color="error"
+                              class="mt-1"
+                              @click="clearDeviceHttpPassword"
+                              >Forget password</v-btn
+                            >
                           </v-col>
                         </v-row>
                         <v-row>
@@ -2338,6 +2382,7 @@ import {
   addDevice,
   deleteDevice,
   updateDevice,
+  setDeviceHttpPassword,
   refreshDevice,
   type Device,
   createURLSource,
@@ -2426,6 +2471,30 @@ const confirmDialog = ref();
 
 // Image Source Binding State
 const useThisServer = ref(true);
+// Write-only input for a frame whose own HTTP API needs a password. Never
+// populated from the server, which only reports http_password_set.
+const deviceHttpPassword = ref('');
+// Reveals the password input when adding a frame. Most frames are open, so
+// the field stays out of the way until it is actually needed.
+const deviceNeedsPassword = ref(false);
+watch(deviceNeedsPassword, (needs) => {
+  if (!needs) deviceHttpPassword.value = '';
+});
+
+async function clearDeviceHttpPassword() {
+  if (!editingDevice.id) return;
+  await setDeviceHttpPassword(editingDevice.id, '');
+  editingDevice.http_password_set = false;
+  // Keep the list in sync too, or reopening the device without saving
+  // would still show a stored password.
+  const listed = availableDevices.value.find(
+    (d: Device) => d.id === editingDevice.id
+  );
+  if (listed) listed.http_password_set = false;
+  deviceHttpPassword.value = '';
+  showMessage('Forgot the stored frame password.');
+}
+
 const selectedSource = ref('immich');
 const sourceOptions = [
   { title: 'Gallery', value: 'gallery' },
@@ -3168,6 +3237,8 @@ const openAddDeviceDialog = () => {
   deviceProcessing.scaleMode = 'cover';
   deviceProcessing.backgroundColor = 'white';
   isAddingDevice.value = true;
+  deviceNeedsPassword.value = false;
+  deviceHttpPassword.value = '';
   deviceDialogTab.value = 'general';
   showEditDeviceDialog.value = true;
 };
@@ -3198,6 +3269,8 @@ const editDevice = async (device: Device) => {
   // Initialize display_orientation from device's orientation
   deviceConfig.display_orientation = device.orientation || 'landscape';
   isAddingDevice.value = false;
+  // Never carry a half-typed password over from another device's dialog.
+  deviceHttpPassword.value = '';
   deviceDialogTab.value = 'general';
   showEditDeviceDialog.value = true;
   deviceImmichAlbumIds.value = [];
@@ -3282,7 +3355,9 @@ const saveDevice = async () => {
         show_calendar: editingDevice.show_calendar || false,
         calendar_id: editingDevice.calendar_id || '',
         date_format: editingDevice.date_format || '',
+        http_password: deviceHttpPassword.value || undefined,
       });
+      deviceHttpPassword.value = '';
       await loadDevices();
       showMessage('Device added. Fetched settings from device.');
       // Re-open in edit mode with fetched config
@@ -3417,6 +3492,18 @@ const saveDevice = async () => {
             dns_server: deviceConfig.dns_server,
           }
         : {};
+
+      // Write-only: only send when the field was filled in. Blank leaves any
+      // stored password alone, matching how the frame treats a null. Done
+      // after validation, so a rejected save does not change the credential,
+      // and before the config push, which has to authenticate with it.
+      if (deviceHttpPassword.value !== '') {
+        await setDeviceHttpPassword(
+          editingDevice.id!,
+          deviceHttpPassword.value
+        );
+        deviceHttpPassword.value = '';
+      }
 
       const result = await updateDeviceConfig(editingDevice.id, {
         config: {

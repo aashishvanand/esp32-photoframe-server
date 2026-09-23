@@ -59,7 +59,26 @@ func (s *DeviceService) ListDevices() ([]model.Device, error) {
 	return devices, nil
 }
 
-func (s *DeviceService) AddDevice(host string, enableCollage, showDate, showPhotoDate, showWeather bool, weatherLat, weatherLon float64, layout string, displayMode string, showCalendar bool, calendarID string, dateFormat string) (*model.Device, error) {
+// SetHTTPPassword stores (or clears, with "") the password the frame requires
+// on its own HTTP API. Kept off UpdateDevice deliberately: that signature is
+// already long, and a write-only secret does not belong in a payload the UI
+// round-trips.
+func (s *DeviceService) SetHTTPPassword(id uint, password string) error {
+	res := s.db.Model(&model.Device{}).Where("id = ?", id).
+		Update("http_password", password)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrDeviceNotFound
+	}
+	return nil
+}
+
+// ErrDeviceNotFound is returned when an id names no device.
+var ErrDeviceNotFound = errors.New("device not found")
+
+func (s *DeviceService) AddDevice(host, httpPassword string, enableCollage, showDate, showPhotoDate, showWeather bool, weatherLat, weatherLon float64, layout string, displayMode string, showCalendar bool, calendarID string, dateFormat string) (*model.Device, error) {
 	// Try to fetch device info (works on LAN, fails for remote devices)
 	var name string
 	var width, height int
@@ -67,7 +86,9 @@ func (s *DeviceService) AddDevice(host string, enableCollage, showDate, showPhot
 
 	var deviceConfig, deviceProc, devicePalette string
 
-	pfClient := photoframe.NewClient(host)
+	// A frame with its own HTTP API password must be probed with it, or every
+	// fetch below 401s and the device lands with placeholder defaults.
+	pfClient := photoframe.NewClientWithPassword(host, httpPassword)
 	sysInfo, err := pfClient.FetchSystemInfo()
 	if err != nil {
 		log.Printf("Could not reach device at %s (may be remote): %v", host, err)
@@ -118,6 +139,7 @@ func (s *DeviceService) AddDevice(host string, enableCollage, showDate, showPhot
 	}
 
 	device := &model.Device{
+		HTTPPassword:             httpPassword,
 		Name:                     name,
 		Host:                     host,
 		Width:                    width,
@@ -143,6 +165,8 @@ func (s *DeviceService) AddDevice(host string, enableCollage, showDate, showPhot
 	if err := s.db.Create(device).Error; err != nil {
 		return nil, err
 	}
+	// AfterFind has not run on a freshly created row.
+	device.HTTPPasswordSet = device.HTTPPassword != ""
 	return device, nil
 }
 
@@ -208,7 +232,7 @@ func (s *DeviceService) RefreshDeviceFromHardware(id uint) (*model.Device, error
 		return nil, errors.New("device not found")
 	}
 
-	pfClient := photoframe.NewClient(device.Host)
+	pfClient := photoframe.NewClientWithPassword(device.Host, device.HTTPPassword)
 
 	sysInfo, err := pfClient.FetchSystemInfo()
 	if err != nil {
@@ -299,7 +323,7 @@ func (s *DeviceService) PushToHost(device *model.Device, imagePath string, extra
 	}
 
 	// Always fetch system info for firmware version check
-	pfClient := photoframe.NewClient(device.Host)
+	pfClient := photoframe.NewClientWithPassword(device.Host, device.HTTPPassword)
 	sysInfo, sysInfoErr := pfClient.FetchSystemInfo()
 	if sysInfoErr != nil {
 		log.Printf("Failed to fetch system info for %s: %v", device.Name, sysInfoErr)

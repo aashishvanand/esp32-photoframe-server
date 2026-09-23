@@ -641,7 +641,7 @@ func (h *ImageHandler) UpdateDeviceConfig(c echo.Context) error {
 	// sync path.
 	pushResult := "synced"
 	if device.Host != "" && configMap != nil {
-		client := photoframe.NewClient(device.Host)
+		client := photoframe.NewClientWithPassword(device.Host, device.HTTPPassword)
 		pushOK := true
 		if len(req.ProcessingSettings) > 0 {
 			if err := client.PushProcessingSettings(req.ProcessingSettings); err != nil {
@@ -801,7 +801,7 @@ func (h *ImageHandler) pullDeviceConfigAsync(device model.Device, deviceTS int64
 		return
 	}
 	go func() {
-		client := photoframe.NewClient(device.Host)
+		client := photoframe.NewClientWithPassword(device.Host, device.HTTPPassword)
 		deadline := time.Now().Add(postRotateWaitSec * time.Second)
 		for {
 			configRaw, err := client.FetchConfig()

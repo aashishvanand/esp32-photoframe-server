@@ -88,16 +88,58 @@ var sharedHTTPClient = &http.Client{
 	Timeout: 120 * time.Second,
 }
 
+// basicAuthTransport attaches the frame's HTTP password to every request.
+// Doing it at the transport rather than at each call site means a newly added
+// request cannot forget it -- there are seven of them in this file already.
+type basicAuthTransport struct {
+	base     http.RoundTripper
+	password string
+}
+
+func (t *basicAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Clone before mutating: RoundTrip must not modify the caller's request.
+	r := req.Clone(req.Context())
+	// The firmware ignores the username; the password is the whole credential.
+	r.SetBasicAuth("photoframe", t.password)
+	return t.base.RoundTrip(r)
+}
+
 type Client struct {
 	host       string
 	resolvedIP string // Cached resolved IP
 	httpClient *http.Client
 }
 
+// MaxHTTPPasswordLen is the longest password the firmware stores
+// (HTTP_PASSWORD_MAX_LEN - 1). It silently truncates anything longer, so a
+// longer value here would never match.
+const MaxHTTPPasswordLen = 63
+
 func NewClient(host string) *Client {
+	return NewClientWithPassword(host, "")
+}
+
+// NewClientWithPassword talks to a frame whose HTTP API is password-protected
+// (esp32-photoframe #130). An empty password means the frame is open, which is
+// the firmware default, and yields the plain shared client.
+func NewClientWithPassword(host, password string) *Client {
+	httpClient := sharedHTTPClient
+	if password != "" {
+		// Wrap the shared transport so connection pooling is still shared.
+		httpClient = &http.Client{
+			Transport: &basicAuthTransport{base: sharedHTTPClient.Transport, password: password},
+			Timeout:   sharedHTTPClient.Timeout,
+			// The transport attaches the password to every request it sees,
+			// so following a redirect could hand it to another host. The
+			// firmware never redirects its API, so just don't follow.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+	}
 	return &Client{
 		host:       host,
-		httpClient: sharedHTTPClient,
+		httpClient: httpClient,
 	}
 }
 

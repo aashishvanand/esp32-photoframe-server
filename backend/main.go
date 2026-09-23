@@ -316,6 +316,7 @@ func main() {
 	protectedApi.GET("/devices", deviceHandler.ListDevices)
 	protectedApi.POST("/devices", deviceHandler.AddDevice)
 	protectedApi.PUT("/devices/:id", deviceHandler.UpdateDevice)
+	protectedApi.PUT("/devices/:id/http-password", deviceHandler.SetHTTPPassword)
 	protectedApi.DELETE("/devices/:id", deviceHandler.DeleteDevice)
 	protectedApi.POST("/devices/:id/push", deviceHandler.PushToDevice)
 	protectedApi.POST("/devices/:id/refresh", deviceHandler.RefreshDevice)

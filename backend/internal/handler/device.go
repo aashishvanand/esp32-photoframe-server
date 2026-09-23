@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/aitjcize/esp32-photoframe-server/backend/internal/model"
 	"github.com/aitjcize/esp32-photoframe-server/backend/internal/service"
+	"github.com/aitjcize/esp32-photoframe-server/backend/pkg/photoframe"
 	"github.com/labstack/echo/v4"
 	"gorm.io/gorm"
 )
@@ -57,6 +59,8 @@ func (h *DeviceHandler) AddDevice(c echo.Context) error {
 		ShowCalendar  bool    `json:"show_calendar"`
 		CalendarID    string  `json:"calendar_id"`
 		DateFormat    string  `json:"date_format"`
+		// Only needed when the frame requires a password on its own HTTP API.
+		HTTPPassword string `json:"http_password"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return respondError(c, http.StatusBadRequest, "invalid request")
@@ -66,15 +70,49 @@ func (h *DeviceHandler) AddDevice(c echo.Context) error {
 		return respondError(c, http.StatusBadRequest, "host required")
 	}
 
+	if len(req.HTTPPassword) > photoframe.MaxHTTPPasswordLen {
+		return respondError(c, http.StatusBadRequest, fmt.Sprintf("frame password must be at most %d bytes", photoframe.MaxHTTPPasswordLen))
+	}
+
 	if req.Layout == "" {
 		req.Layout = model.LayoutPhotoOverlay
 	}
 
-	device, err := h.deviceService.AddDevice(req.Host, req.EnableCollage, req.ShowDate, req.ShowPhotoDate, req.ShowWeather, req.WeatherLat, req.WeatherLon, req.Layout, req.DisplayMode, req.ShowCalendar, req.CalendarID, req.DateFormat)
+	device, err := h.deviceService.AddDevice(req.Host, req.HTTPPassword, req.EnableCollage, req.ShowDate, req.ShowPhotoDate, req.ShowWeather, req.WeatherLat, req.WeatherLon, req.Layout, req.DisplayMode, req.ShowCalendar, req.CalendarID, req.DateFormat)
 	if err != nil {
 		return respondError(c, http.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(http.StatusCreated, device)
+}
+
+// SetHTTPPassword stores the password for a frame whose own HTTP API is
+// password-protected (esp32-photoframe #130). Write-only on purpose: the value
+// is never returned, only the http_password_set flag on the device. Send an
+// empty string to forget it, which is what you do after turning the frame's
+// authentication back off.
+//
+// PUT /api/devices/:id/http-password
+func (h *DeviceHandler) SetHTTPPassword(c echo.Context) error {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		return respondError(c, http.StatusBadRequest, "invalid device id")
+	}
+	var req struct {
+		HTTPPassword string `json:"http_password"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return respondError(c, http.StatusBadRequest, "invalid request")
+	}
+	if len(req.HTTPPassword) > photoframe.MaxHTTPPasswordLen {
+		return respondError(c, http.StatusBadRequest, fmt.Sprintf("frame password must be at most %d bytes", photoframe.MaxHTTPPasswordLen))
+	}
+	if err := h.deviceService.SetHTTPPassword(uint(id), req.HTTPPassword); err != nil {
+		if errors.Is(err, service.ErrDeviceNotFound) {
+			return respondError(c, http.StatusNotFound, "device not found")
+		}
+		return respondError(c, http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]bool{"http_password_set": req.HTTPPassword != ""})
 }
 
 // PUT /api/devices/:id

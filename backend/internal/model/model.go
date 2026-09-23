@@ -99,12 +99,27 @@ type Device struct {
 	ShowCalendar bool   `json:"show_calendar"`
 	CalendarID   string `json:"calendar_id"` // Google Calendar ID (per-device)
 	DateFormat   string `json:"date_format"` // Go time format string, empty = default "Mon, Jan 02"
+	// Password for the frame's own HTTP API when its owner enabled the
+	// optional authentication. Empty = open, the firmware default. Never
+	// serialized outward -- the UI posts it and only learns whether one is
+	// set (see HTTPPasswordSet on the API response).
+	HTTPPassword string `json:"-" gorm:"column:http_password;default:''"`
+	// Reported instead of the password itself, so the UI can show whether one
+	// is configured without the value ever leaving the server.
+	HTTPPasswordSet bool `json:"http_password_set" gorm:"-"`
 	// Remote config sync fields (JSON blobs synced from/to device)
 	DeviceConfig             string    `json:"device_config" gorm:"default:'{}'"`
 	DeviceProcessingSettings string    `json:"device_processing_settings" gorm:"default:'{}'"`
 	DeviceColorPalette       string    `json:"device_color_palette" gorm:"default:'{}'"`
 	ConfigLastUpdated        int64     `json:"config_last_updated" gorm:"default:0"`
 	CreatedAt                time.Time `json:"created_at"`
+}
+
+// AfterFind reports whether a device HTTP password is stored without ever
+// serializing the value. Done as a hook so every load path gets it right.
+func (d *Device) AfterFind(tx *gorm.DB) error {
+	d.HTTPPasswordSet = d.HTTPPassword != ""
+	return nil
 }
 
 // IsGrayscale reports whether this device drives a grayscale (GC16) panel.

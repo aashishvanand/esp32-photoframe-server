@@ -73,6 +73,9 @@ export interface Device {
   display_mode?: string;
   background_color?: string;
   battery_level?: number;
+  // Whether a password is stored for a frame whose own HTTP API is
+  // protected. The password itself is never returned.
+  http_password_set?: boolean;
   battery_reported_at?: string;
   firmware_version?: string;
   show_calendar?: boolean;
@@ -106,8 +109,22 @@ export const addDevice = async (params: {
   show_calendar?: boolean;
   calendar_id?: string;
   date_format?: string;
+  // Only needed when the frame requires a password on its own HTTP API.
+  http_password?: string;
 }) => {
   const response = await api.post('devices', params);
+  return response.data;
+};
+
+// Stores (or clears, with "") the password a frame requires on its own HTTP
+// API. Write-only: the server reports only http_password_set.
+export const setDeviceHttpPassword = async (
+  id: number,
+  httpPassword: string
+) => {
+  const response = await api.put(`/devices/${id}/http-password`, {
+    http_password: httpPassword,
+  });
   return response.data;
 };
 
