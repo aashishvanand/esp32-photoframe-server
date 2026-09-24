@@ -448,8 +448,8 @@ function rawValid(card: ScheduleCard): boolean {
           {{ r }}
         </v-chip>
         <div class="text-caption text-disabled mt-1">
-          Times shown in this browser's timezone; the device follows its own
-          timezone setting.
+          Times shown in this browser's time zone; the frame follows the Time
+          zone on its General tab.
         </div>
       </template>
       <div v-else class="text-caption text-disabled">

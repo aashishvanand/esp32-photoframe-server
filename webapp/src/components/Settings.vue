@@ -1290,18 +1290,78 @@
                             ></v-select>
                           </v-col>
                         </v-row>
+                        <!-- Time zone (#128). The frame stores a POSIX TZ
+                             rule and applies it with tzset(), so a zone
+                             with DST works; the picker names the rule,
+                             the advanced field takes any rule verbatim. -->
                         <v-row>
                           <v-col cols="12" md="6">
-                            <v-text-field
-                              v-model.number="deviceConfig.timezone_offset"
-                              label="Timezone (UTC offset)"
-                              type="number"
-                              :min="-12"
-                              :max="14"
-                              :step="0.5"
+                            <v-autocomplete
+                              v-model="tzZone"
+                              :items="tzItems"
+                              label="Time zone"
                               variant="outlined"
                               density="compact"
-                              hint="e.g., -8 for PST, +1 for CET, +8 for CST"
+                              auto-select-first
+                              :hint="tzHint"
+                              persistent-hint
+                              @focusin="selectTzSearch"
+                            ></v-autocomplete>
+                            <div
+                              v-if="tzCaveat !== null"
+                              class="text-caption text-warning mt-1"
+                            >
+                              {{ tzCaveat }}
+                            </div>
+                          </v-col>
+                          <v-col
+                            cols="12"
+                            md="6"
+                            class="d-flex flex-wrap align-center ga-2"
+                          >
+                            <v-btn
+                              size="small"
+                              variant="tonal"
+                              :disabled="
+                                browserZoneRule === null ||
+                                deviceConfig.timezone === browserZoneRule
+                              "
+                              @click="useBrowserZone"
+                            >
+                              Use this browser's time zone
+                            </v-btn>
+                            <span
+                              v-if="browserZone !== null"
+                              class="text-caption text-medium-emphasis"
+                            >
+                              {{ browserZone
+                              }}{{
+                                browserZoneRule === null
+                                  ? ' is not in the list'
+                                  : ''
+                              }}
+                            </span>
+                          </v-col>
+                        </v-row>
+                        <v-row>
+                          <v-col cols="12" md="6">
+                            <v-checkbox
+                              v-model="tzRuleShown"
+                              label="Advanced: POSIX TZ rule"
+                              density="compact"
+                              hide-details
+                              :disabled="tzChoice.kind !== 'zone'"
+                            ></v-checkbox>
+                            <v-text-field
+                              v-if="tzRuleShown"
+                              v-model="deviceConfig.timezone"
+                              label="POSIX TZ rule"
+                              variant="outlined"
+                              density="compact"
+                              spellcheck="false"
+                              autocapitalize="off"
+                              :error-messages="tzProblem ? [tzProblem] : []"
+                              hint="Any rule the frame's tzset() takes, e.g. EST5EDT,M3.2.0,M11.1.0. Fixed offsets count hours west: UTC-8 is UTC+8."
                               persistent-hint
                             ></v-text-field>
                           </v-col>
@@ -2540,6 +2600,15 @@ import TopicManager from './TopicManager.vue';
 import SecurityTab from './SecurityTab.vue';
 import RotationSchedule from './RotationSchedule.vue';
 import { intervalToCron, cronToInterval, isValidCron } from '../utils/cron';
+import {
+  DEFAULT_TZ_RULE,
+  TIMEZONE_NAMES,
+  browserTimeZone,
+  choiceForRule,
+  ruleForZone,
+  tzRuleProblem,
+  zoneCaveat,
+} from '../utils/timezone';
 
 const { smAndDown } = useDisplay(); // true on phones / small tablets
 const store = useSettingsStore();
@@ -2922,7 +2991,9 @@ const deviceConfig = reactive<Record<string, any>>({
   sleep_end_time: '07:00',
   display_orientation: 'landscape',
   display_rotation_deg: 180,
-  timezone_offset: 0,
+  // The POSIX TZ rule the frame stores, kept verbatim (#128). It is never
+  // reduced to an offset: a DST rule used to load as 0 and save as "UTC0".
+  timezone: DEFAULT_TZ_RULE,
   ntp_server: 'pool.ntp.org',
   // Advanced network settings (firmware #43)
   ip_mode: 'dhcp',
@@ -2935,6 +3006,80 @@ const deviceConfig = reactive<Record<string, any>>({
   openai_api_key: '',
   google_api_key: '',
 });
+
+// Time zone picker (#128). deviceConfig.timezone is the truth; the picker
+// only names it. Picking a zone writes that zone's rule; a rule no zone
+// yields shows as a synthesized "Fixed offset" or "Custom rule" entry.
+const browserZone = browserTimeZone();
+const browserZoneRule = browserZone === null ? null : ruleForZone(browserZone);
+// The zone the user picked, kept on show while its rule is still the one
+// set: many zones share a rule, and Europe/Berlin must not turn into
+// Africa/Ceuta the moment it is chosen. Null after a load, when the
+// browser's zone is the best guess for a rule the frame already had.
+const tzPicked = ref<string | null>(null);
+const tzChoice = computed(() =>
+  choiceForRule(deviceConfig.timezone, [tzPicked.value, browserZone])
+);
+// The picker value for a rule the table cannot name. Not an IANA name.
+const TZ_UNNAMED = '(unnamed)';
+const tzItems = computed(() => {
+  const items = TIMEZONE_NAMES.map((name) => ({ title: name, value: name }));
+  const choice = tzChoice.value;
+  if (choice.kind === 'fixed') {
+    items.unshift({ title: choice.label, value: TZ_UNNAMED });
+  } else if (choice.kind === 'custom') {
+    items.unshift({ title: 'Custom rule', value: TZ_UNNAMED });
+  }
+  return items;
+});
+const tzZone = computed({
+  get: () => {
+    const choice = tzChoice.value;
+    return choice.kind === 'zone' ? choice.name : TZ_UNNAMED;
+  },
+  set: (name: string | null) => {
+    // Re-picking the synthesized entry, or clearing, changes nothing.
+    const rule = name === null ? null : ruleForZone(name);
+    if (rule === null) return;
+    tzPicked.value = name;
+    deviceConfig.timezone = rule;
+  },
+});
+const tzProblem = computed(() => tzRuleProblem(deviceConfig.timezone));
+const tzHint = computed(() =>
+  tzProblem.value === null
+    ? `POSIX rule ${deviceConfig.timezone}. The rotation schedule runs in this zone.`
+    : 'The rotation schedule runs in this zone.'
+);
+// Where the frame will not keep the named zone's time exactly, say so.
+const tzCaveat = computed(() => {
+  const choice = tzChoice.value;
+  return choice.kind === 'zone' ? zoneCaveat(choice.name) : null;
+});
+// The advanced field is opt-in while the picker can name the rule, and
+// stays open when it cannot: that is the only place such a rule is editable.
+// A load opens it for real when the rule is unnamed, not just by the
+// fallback: a rule being typed can pass through a zone's ("GMT0" on the way
+// to "GMT0BST,..."), and the fallback alone would unmount the field there.
+const tzRuleOpened = ref(false);
+const tzRuleShown = computed({
+  get: () => tzRuleOpened.value || tzChoice.value.kind !== 'zone',
+  set: (shown: boolean) => {
+    tzRuleOpened.value = shown;
+  },
+});
+const useBrowserZone = () => {
+  if (browserZoneRule === null) return;
+  tzPicked.value = browserZone;
+  deviceConfig.timezone = browserZoneRule;
+};
+// On focus Vuetify puts the shown name in the search box, unselected, so
+// typing would append to "Africa/Ceuta" and match nothing. Select it, so
+// typing replaces it; the name it filled in lands in the box a tick later.
+const selectTzSearch = (e: FocusEvent) => {
+  const el = e.target;
+  if (el instanceof HTMLInputElement) nextTick(() => el.select());
+};
 
 // Whether the device firmware understands rotate_cron. Old firmware reports
 // only rotate_interval and silently ignores a cron schedule. Best-effort:
@@ -3221,17 +3366,14 @@ const loadDeviceConfig = async (deviceId: number) => {
     const endMin = cfg.sleep_schedule_end ?? 420;
     deviceConfig.sleep_end_time = `${String(Math.floor(endMin / 60)).padStart(2, '0')}:${String(endMin % 60).padStart(2, '0')}`;
 
-    // Parse POSIX timezone (e.g., "UTC-8" → 8, "UTC+1" → -1, POSIX sign is inverted)
-    const tz = cfg.timezone || 'UTC0';
-    const tzMatch = tz.match(/UTC([+-]?)(\d+)(?::(\d+))?/);
-    if (tzMatch) {
-      const sign = tzMatch[1] === '-' ? 1 : -1;
-      const hours = parseInt(tzMatch[2]) || 0;
-      const minutes = parseInt(tzMatch[3]) || 0;
-      deviceConfig.timezone_offset = sign * (hours + minutes / 60);
-    } else {
-      deviceConfig.timezone_offset = 0;
-    }
+    // The frame's POSIX TZ rule, verbatim. Whatever it is -- a fixed offset,
+    // a DST rule, something typed by hand -- it goes back unchanged on save.
+    deviceConfig.timezone =
+      typeof cfg.timezone === 'string' && cfg.timezone !== ''
+        ? cfg.timezone
+        : DEFAULT_TZ_RULE;
+    tzPicked.value = null;
+    tzRuleOpened.value = tzChoice.value.kind !== 'zone';
 
     // Processing settings
     const proc = parse(data.processing_settings);
@@ -3513,8 +3655,11 @@ const openAddDeviceDialog = () => {
     sleep_start_time: '23:00',
     sleep_end_time: '07:00',
     display_orientation: 'landscape',
+    timezone: DEFAULT_TZ_RULE,
     deep_sleep_enabled: true,
   });
+  tzPicked.value = null;
+  tzRuleOpened.value = false;
   // The Display Settings selects bind to deviceProcessing; without a reset
   // they would carry the previously edited device's layout into the dialog
   deviceProcessing.scaleMode = 'cover';
@@ -3611,6 +3756,11 @@ const saveDevice = async () => {
     showMessage('Host is required', true);
     return;
   }
+  // The frame would truncate or misapply the rule without a word (#128).
+  if (tzProblem.value !== null) {
+    showMessage(`Time zone: ${tzProblem.value}`, true);
+    return;
+  }
   if (editingDevice.show_weather) {
     if (
       editingDevice.weather_lat === null ||
@@ -3691,20 +3841,6 @@ const saveDevice = async () => {
         .split(':')
         .map(Number);
       const [endH, endM] = deviceConfig.sleep_end_time.split(':').map(Number);
-
-      // Convert UTC offset to POSIX timezone format (sign is inverted)
-      const offsetVal = deviceConfig.timezone_offset || 0;
-      let timezone = 'UTC0';
-      if (offsetVal !== 0) {
-        const absOff = Math.abs(offsetVal);
-        const h = Math.floor(absOff);
-        const m = Math.round((absOff - h) * 60);
-        const sign = offsetVal > 0 ? '-' : '+';
-        timezone =
-          m === 0
-            ? `UTC${sign}${h}`
-            : `UTC${sign}${h}:${String(m).padStart(2, '0')}`;
-      }
 
       // Compute image URL: use server URL if "use this server" is checked.
       // getImageUrl() targets the direct add-on port, so the URL works when
@@ -3801,7 +3937,7 @@ const saveDevice = async () => {
           ...sleepFields,
           display_orientation: deviceConfig.display_orientation,
           display_rotation_deg: deviceConfig.display_rotation_deg,
-          timezone: timezone,
+          timezone: deviceConfig.timezone,
           ntp_server: deviceConfig.ntp_server,
           ...networkFields,
           deep_sleep_enabled: deviceConfig.deep_sleep_enabled,
