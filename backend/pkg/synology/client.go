@@ -290,11 +290,15 @@ func (c *Client) GetPhoto(id int, cacheKey string, size string, album AlbumRef, 
 	}
 
 	// Strictly match parameter order from curl:
-	// id=3253&cache_key=%22...%22&type=%22unit%22&size=%22xl%22&album_id=21&api=%22...%22&method=%22get%22&version=2&SynoToken=...
+	// id=3253&cache_key=%22...%22&type=%22item%22&size=%22xl%22&album_id=21&api=%22...%22&method=%22get%22&version=2&SynoToken=...
+	//
+	// id is the item ID, so type must be "item". type "unit" expects the
+	// thumbnail's unit_id, which only happens to equal the item ID for older
+	// items; for the rest DSM answers 404.
 	parts := []string{
 		fmt.Sprintf("id=%d", id),
 		fmt.Sprintf("cache_key=%s", url.QueryEscape(fmt.Sprintf("\"%s\"", cacheKey))),
-		"type=%22unit%22",
+		"type=%22item%22",
 		fmt.Sprintf("size=%s", url.QueryEscape(fmt.Sprintf("\"%s\"", sz))),
 	}
 	if album.ID != 0 {

@@ -404,10 +404,7 @@ func (s *SynologyService) FetchAlbumAssets(album model.Album) ([]RemoteAsset, er
 	out := make([]RemoteAsset, 0, len(photos))
 	for _, p := range photos {
 		pw, ph := p.Additional.Resolution.Width, p.Additional.Resolution.Height
-		thumbKey := p.Additional.Thumbnail.M
-		if p.Additional.Thumbnail.XL != "" {
-			thumbKey = p.Additional.Thumbnail.XL
-		}
+		thumbKey := thumbnailKey(p)
 		var photoTaken *time.Time
 		if p.Time > 0 {
 			t := time.Unix(p.Time, 0)
@@ -469,6 +466,20 @@ func (s *SynologyService) ensureGlobalAlbumSeed() {
 	if err := s.db.Create(&album).Error; err != nil {
 		log.Printf("Synology: failed to seed global album row: %v", err)
 	}
+}
+
+// thumbnailKey returns the cache key to request an item's thumbnail with. DSM
+// reports the real key in thumbnail.cache_key; the per-size fields hold only a
+// status such as "ready" and are used only when cache_key is absent.
+func thumbnailKey(p synology.Item) string {
+	t := p.Additional.Thumbnail
+	if t.CacheKey != "" {
+		return t.CacheKey
+	}
+	if t.XL != "" {
+		return t.XL
+	}
+	return t.M
 }
 
 // resolvePhotoDimensions decodes a thumbnail to recover an image's dimensions
@@ -538,11 +549,7 @@ func (s *SynologyService) backfillMissingResolutions(photos []synology.Item, alb
 		if resolved[p.ID] {
 			continue
 		}
-		thumbKey := p.Additional.Thumbnail.M
-		if thumbKey == "" {
-			thumbKey = p.Additional.Thumbnail.XL
-		}
-		w, h, err := s.resolvePhotoDimensions(p.ID, thumbKey, album)
+		w, h, err := s.resolvePhotoDimensions(p.ID, thumbnailKey(*p), album)
 		if err != nil || w <= 0 || h <= 0 {
 			log.Printf("synology: could not decode dimensions for photo %d: %v", p.ID, err)
 			continue
