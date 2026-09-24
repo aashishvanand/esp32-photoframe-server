@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"image"
 	"testing"
 
@@ -47,7 +48,7 @@ func TestPickRandomWithFallback_PassesOrientation(t *testing.T) {
 		seen = append(seen, pickCall{orientation, len(exclude)})
 		return model.Image{ID: 1, Orientation: orientation}, nil
 	}
-	item, err := pickRandomWithFallback(pick, "portrait", []uint{2, 3})
+	item, err := pickRandomWithFallback(pick, "portrait", []uint{2, 3}, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, "portrait", item.Orientation)
 	assert.Equal(t, []pickCall{{"portrait", 2}}, seen)
@@ -64,7 +65,7 @@ func TestPickRandomWithFallback_DropsExclusionsBeforeOrientation(t *testing.T) {
 		}
 		return model.Image{}, gorm.ErrRecordNotFound
 	}
-	item, err := pickRandomWithFallback(pick, "portrait", []uint{1, 2})
+	item, err := pickRandomWithFallback(pick, "portrait", []uint{1, 2}, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, uint(5), item.ID)
 	assert.Equal(t, "portrait", item.Orientation)
@@ -82,7 +83,7 @@ func TestPickRandomWithFallback_FallsBackToAnyOrientation(t *testing.T) {
 		}
 		return model.Image{}, gorm.ErrRecordNotFound
 	}
-	item, err := pickRandomWithFallback(pick, "portrait", []uint{1})
+	item, err := pickRandomWithFallback(pick, "portrait", []uint{1}, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, uint(9), item.ID)
 	// portrait+exclude → portrait+none → any(none).
@@ -131,4 +132,133 @@ func TestRunDBPhotoFlow_FallbackWhenNoOrientationMatch(t *testing.T) {
 	resp, err := RunDBPhotoFlow(req, db, dbPicker(db), stubLoader)
 	assert.NoError(t, err)
 	assert.Len(t, resp.ImageIDs, 1)
+}
+
+var errBrokenPhoto = errors.New("download returned status: 404")
+
+// failingLoader fails for the photos whose ExternalID is in broken and returns
+// a portrait (10x20) image for the rest, recording every load attempt.
+func failingLoader(broken map[string]bool, loaded *[]string) PhotoLoader {
+	return func(item model.Image) (image.Image, error) {
+		*loaded = append(*loaded, item.ExternalID)
+		if broken[item.ExternalID] {
+			return nil, errBrokenPhoto
+		}
+		return image.NewRGBA(image.Rect(0, 0, 10, 20)), nil
+	}
+}
+
+// A photo that fails to load is excluded and another one picked, instead of
+// failing the whole request (issue #61).
+func TestRunDBPhotoFlow_RetriesAnotherPhotoOnLoadFailure(t *testing.T) {
+	var seen [][]uint
+	pick := func(orientation string, exclude []uint) (model.Image, error) {
+		seen = append(seen, append([]uint(nil), exclude...))
+		for _, id := range exclude {
+			if id == 1 {
+				return model.Image{ID: 2, ExternalID: "good"}, nil
+			}
+		}
+		return model.Image{ID: 1, ExternalID: "bad"}, nil
+	}
+	var loaded []string
+	load := failingLoader(map[string]bool{"bad": true}, &loaded)
+
+	req := &imagesource.Request{Orientation: "portrait", Width: 480, Height: 800, ExcludeIDs: []uint{7}}
+	resp, err := RunDBPhotoFlow(req, setupAlbumDB(t), pick, load)
+	assert.NoError(t, err)
+	assert.Equal(t, []uint{2}, resp.ImageIDs)
+	assert.Equal(t, []string{"bad", "good"}, loaded)
+	// The retry keeps the history exclusion and adds the failed photo.
+	assert.Equal(t, [][]uint{{7}, {7, 1}}, seen)
+}
+
+// A failed photo stays excluded even when the picker relaxes the history
+// exclusion, so a small library doesn't re-pick the broken photo.
+func TestRunDBPhotoFlow_FailedPhotoStaysExcludedWithoutHistory(t *testing.T) {
+	db := setupAlbumDB(t)
+	mkOrientedImage(t, db, "bad", "portrait")
+	good := mkOrientedImage(t, db, "good", "portrait")
+
+	for i := 0; i < 20; i++ {
+		var loaded []string
+		load := failingLoader(map[string]bool{"bad": true}, &loaded)
+		// Excluding the good photo as history forces the relaxed pick.
+		req := &imagesource.Request{Orientation: "portrait", Width: 480, Height: 800, ExcludeIDs: []uint{good.ID}}
+		resp, err := RunDBPhotoFlow(req, db, dbPicker(db), load)
+		assert.NoError(t, err)
+		assert.Equal(t, []uint{good.ID}, resp.ImageIDs)
+	}
+}
+
+// When every attempt fails, the request gives up after maxPhotoLoadAttempts
+// with the load error.
+func TestRunDBPhotoFlow_GivesUpAfterMaxAttempts(t *testing.T) {
+	db := setupAlbumDB(t)
+	broken := map[string]bool{}
+	for _, ext := range []string{"b1", "b2", "b3", "b4", "b5"} {
+		mkOrientedImage(t, db, ext, "portrait")
+		broken[ext] = true
+	}
+	var loaded []string
+	req := &imagesource.Request{Orientation: "portrait", Width: 480, Height: 800}
+	_, err := RunDBPhotoFlow(req, db, dbPicker(db), failingLoader(broken, &loaded))
+	assert.ErrorIs(t, err, errBrokenPhoto)
+	assert.Contains(t, err.Error(), "3 photos in a row failed to load")
+	assert.Len(t, loaded, maxPhotoLoadAttempts)
+	// Each attempt tried a different photo.
+	assert.Len(t, map[string]bool{loaded[0]: true, loaded[1]: true, loaded[2]: true}, 3)
+}
+
+// When the only photos fail to load, the load error is reported rather than
+// "record not found" — the library isn't empty, its photos are unreachable.
+func TestRunDBPhotoFlow_ReportsLoadErrorWhenPoolRunsDry(t *testing.T) {
+	db := setupAlbumDB(t)
+	mkOrientedImage(t, db, "bad", "portrait")
+
+	var loaded []string
+	req := &imagesource.Request{Orientation: "portrait", Width: 480, Height: 800}
+	_, err := RunDBPhotoFlow(req, db, dbPicker(db), failingLoader(map[string]bool{"bad": true}, &loaded))
+	assert.ErrorIs(t, err, errBrokenPhoto)
+	assert.NotErrorIs(t, err, gorm.ErrRecordNotFound)
+	assert.Equal(t, []string{"bad"}, loaded)
+}
+
+// Smart collage retries a slot whose photo fails to load: a landscape device
+// with only portrait photos always gets two different, loadable photos.
+func TestSmartCollage_RetriesFailedSlot(t *testing.T) {
+	db := setupAlbumDB(t)
+	mkOrientedImage(t, db, "bad", "portrait")
+	p1 := mkOrientedImage(t, db, "p1", "portrait")
+	p2 := mkOrientedImage(t, db, "p2", "portrait")
+
+	req := &imagesource.Request{
+		Orientation: "landscape", Width: 800, Height: 480,
+		Device: &model.Device{EnableCollage: true},
+	}
+	for i := 0; i < 20; i++ {
+		var loaded []string
+		resp, err := RunDBPhotoFlow(req, db, dbPicker(db), failingLoader(map[string]bool{"bad": true}, &loaded))
+		assert.NoError(t, err)
+		assert.ElementsMatch(t, []uint{p1.ID, p2.ID}, resp.ImageIDs)
+	}
+}
+
+// When no second photo can be loaded, the collage falls back to the first
+// photo in both slots instead of failing the request.
+func TestSmartCollage_FallsBackWhenSlotCannotBeFilled(t *testing.T) {
+	db := setupAlbumDB(t)
+	mkOrientedImage(t, db, "bad", "portrait")
+	good := mkOrientedImage(t, db, "good", "portrait")
+
+	req := &imagesource.Request{
+		Orientation: "landscape", Width: 800, Height: 480,
+		Device: &model.Device{EnableCollage: true},
+	}
+	for i := 0; i < 20; i++ {
+		var loaded []string
+		resp, err := RunDBPhotoFlow(req, db, dbPicker(db), failingLoader(map[string]bool{"bad": true}, &loaded))
+		assert.NoError(t, err)
+		assert.Equal(t, []uint{good.ID, good.ID}, resp.ImageIDs)
+	}
 }

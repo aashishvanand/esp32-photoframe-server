@@ -7,6 +7,7 @@ package service
 // so the plugins stay small and uniform.
 
 import (
+	"fmt"
 	"image"
 	"log"
 	"os"
@@ -49,11 +50,7 @@ func RunDBPhotoFlow(
 		img, ids, err = smartCollage(req.Orientation, req.Width, req.Height, req.ExcludeIDs, pick, load)
 	} else {
 		var item model.Image
-		item, err = pickRandomWithFallback(pick, req.Orientation, req.ExcludeIDs)
-		if err != nil {
-			return nil, err
-		}
-		img, err = load(item)
+		item, img, err = pickAndLoad(pick, load, req.Orientation, req.ExcludeIDs, nil)
 		if err == nil {
 			ids = []uint{item.ID}
 		}
@@ -89,30 +86,77 @@ func PickRandomDBPhoto(db *gorm.DB, source, orientationFilter string, excludeIDs
 	return item, err
 }
 
+// maxPhotoLoadAttempts bounds how many different photos one request tries
+// to load before giving up, so a single broken or unreachable photo (deleted
+// upstream, NAS 404, corrupt file) doesn't fail the whole refresh — issue #61.
+const maxPhotoLoadAttempts = 3
+
 // pickRandomWithFallback prefers the device orientation, then relaxes the
 // exclusion list, then relaxes the orientation — so a portrait device draws
 // portrait photos but still shows something when its library is small or has
 // no matching-orientation photos. Pass orientation="" (e.g. the collage path,
 // which composes across orientations) for the original any-orientation pick.
-func pickRandomWithFallback(pick PhotoPicker, orientation string, excludeIDs []uint) (model.Image, error) {
+// failedIDs are photos that already failed to load in this request; unlike
+// excludeIDs they are never relaxed.
+func pickRandomWithFallback(pick PhotoPicker, orientation string, excludeIDs, failedIDs []uint) (model.Image, error) {
 	// 1. Device orientation, excluding recently shown photos.
-	item, err := pick(orientation, excludeIDs)
+	item, err := pick(orientation, append(append([]uint(nil), excludeIDs...), failedIDs...))
 	if err == nil {
 		return item, nil
 	}
 	// 2. Same orientation, but allow recently shown photos (small library).
 	if len(excludeIDs) > 0 {
-		if item, err = pick(orientation, nil); err == nil {
+		if item, err = pick(orientation, failedIDs); err == nil {
 			return item, nil
 		}
 	}
 	// 3. No photo matches the orientation at all — fall back to any.
 	if orientation != "" {
-		if item, err = pick("", nil); err == nil {
+		if item, err = pick("", failedIDs); err == nil {
 			return item, nil
 		}
 	}
 	return item, err
+}
+
+// pickAndLoad picks a photo with pickRandomWithFallback and loads it. When a
+// load fails, that photo is appended to *failedIDs and another one is picked,
+// up to maxPhotoLoadAttempts. If the pool runs dry after a load failure, the
+// load error is returned rather than the picker's "record not found", since
+// photos do exist — they just can't be loaded.
+func pickAndLoad(
+	pick PhotoPicker,
+	load PhotoLoader,
+	orientation string,
+	excludeIDs []uint,
+	failedIDs *[]uint,
+) (model.Image, image.Image, error) {
+	if failedIDs == nil {
+		failedIDs = new([]uint)
+	}
+	var lastErr error
+	for attempt := 1; attempt <= maxPhotoLoadAttempts; attempt++ {
+		item, err := pickRandomWithFallback(pick, orientation, excludeIDs, *failedIDs)
+		if err != nil {
+			if lastErr != nil {
+				return model.Image{}, nil, fmt.Errorf("%d photo(s) failed to load and no other photo is available: %w", len(*failedIDs), lastErr)
+			}
+			return model.Image{}, nil, err
+		}
+		img, err := load(item)
+		if err == nil {
+			return item, img, nil
+		}
+		logPhotoLoadFailure(item, attempt, err)
+		*failedIDs = append(*failedIDs, item.ID)
+		lastErr = err
+	}
+	return model.Image{}, nil, fmt.Errorf("%d photos in a row failed to load: %w", maxPhotoLoadAttempts, lastErr)
+}
+
+func logPhotoLoadFailure(item model.Image, attempt int, err error) {
+	log.Printf("photo %d (source %s, external id %q) failed to load (attempt %d/%d): %v",
+		item.ID, item.Source, item.ExternalID, attempt, maxPhotoLoadAttempts, err)
 }
 
 // smartCollage fetches one or two photos and composes them into a collage
@@ -135,11 +179,8 @@ func smartCollage(
 
 	// The collage composes across orientations, so the first pick stays
 	// orientation-agnostic — its shape decides single vs. collage.
-	item1, err := pickRandomWithFallback(pick, "", excludeIDs)
-	if err != nil {
-		return nil, nil, err
-	}
-	img1, err := load(item1)
+	var failedIDs []uint
+	item1, img1, err := pickAndLoad(pick, load, "", excludeIDs, &failedIDs)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -162,25 +203,33 @@ func smartCollage(
 		targetType = "portrait"
 	}
 
-	// 1. Exclude history + the first photo.
-	excludeWithHistory := append(append([]uint(nil), excludeIDs...), item1.ID)
-	item2, err := pick(targetType, excludeWithHistory)
-	if err != nil || item2.ID == item1.ID {
-		log.Printf("smartCollage: %s query with history exclusion failed: %v, retrying without history", targetType, err)
-		// 2. Just exclude the first photo, ignore history.
-		item2, err = pick(targetType, []uint{item1.ID})
-	}
-
+	// A second photo that fails to load is skipped and another one tried;
+	// photos that already failed stay excluded even without history.
 	var img2 image.Image
-	if err == nil && item2.ID != item1.ID {
-		img2, err = load(item2)
+	for attempt := 1; attempt <= maxPhotoLoadAttempts && img2 == nil; attempt++ {
+		skip := append([]uint{item1.ID}, failedIDs...)
+		// 1. Exclude history + the first photo.
+		item2, err := pick(targetType, append(append([]uint(nil), excludeIDs...), skip...))
+		if err != nil || item2.ID == item1.ID {
+			log.Printf("smartCollage: %s query with history exclusion failed: %v, retrying without history", targetType, err)
+			// 2. Just exclude the first photo, ignore history.
+			item2, err = pick(targetType, skip)
+		}
+		if err != nil || item2.ID == item1.ID {
+			break
+		}
+		if img2, err = load(item2); err != nil {
+			logPhotoLoadFailure(item2, attempt, err)
+			failedIDs = append(failedIDs, item2.ID)
+			img2 = nil
+			continue
+		}
+		servedIDs = append(servedIDs, item2.ID)
 	}
-	if err != nil || item2.ID == item1.ID {
+	if img2 == nil {
 		log.Printf("smartCollage: no different %s photo found, using same photo twice", targetType)
 		img2 = img1
 		servedIDs = append(servedIDs, item1.ID)
-	} else {
-		servedIDs = append(servedIDs, item2.ID)
 	}
 
 	if devicePortrait {
