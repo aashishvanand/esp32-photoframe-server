@@ -20,10 +20,15 @@ type Item struct {
 	FolderID    int    `json:"folder_id"`
 	Type        string `json:"type"` // "photo" or "video"
 	Additional  struct {
+		// Thumbnail: m/xl/sm are per-size status flags ("ready", "broken", ...),
+		// not keys. The thumbnail is stored under UnitID, which differs from the
+		// item ID for many newer items; CacheKey is "<unit_id>_<timestamp>".
 		Thumbnail struct {
-			M  string `json:"m"` // Cache key or similar
-			XL string `json:"xl"`
-			S  string `json:"s"`
+			M        string `json:"m"`
+			XL       string `json:"xl"`
+			S        string `json:"sm"`
+			CacheKey string `json:"cache_key"`
+			UnitID   int    `json:"unit_id"`
 		} `json:"thumbnail"`
 		Resolution struct {
 			Width  int `json:"width"`
