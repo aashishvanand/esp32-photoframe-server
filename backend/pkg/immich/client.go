@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -225,9 +226,12 @@ const legacyMemoriesForLayout = "2006-01-02T15:04:05.000Z"
 // midnight; date-only is tried first (required by Immich v3.0.3+) with a
 // retry in the legacy timestamp format for v3.0.0–v3.0.2 on a 400.
 //
-// When latestYearOnly is true, only the most recent year's lane is returned
-// (a focused "last year on this day" experience); otherwise every lane is
-// flattened into one pool so the frame shuffles across all years.
+// When latestYearOnly is true, only the most recent year's lane with at least
+// one servable image is returned (a focused "last year on this day"
+// experience); otherwise every lane is flattened into one pool so the frame
+// shuffles across all years. Lanes are judged after the IsServableImage
+// filter, so a video-only newest year falls back to an older one rather than
+// leaving nothing to sync — see issue #48.
 func (c *Client) GetMemoryAssets(latestYearOnly bool) ([]Asset, error) {
 	now := time.Now()
 	lanes, status, err := c.getMemoryLanes(now.Format(time.DateOnly))
@@ -239,14 +243,18 @@ func (c *Client) GetMemoryAssets(latestYearOnly bool) ([]Asset, error) {
 	}
 
 	if latestYearOnly {
-		if len(lanes) == 0 {
-			return nil, nil
-		}
-		best := lanes[0]
-		for _, lane := range lanes[1:] {
-			if lane.Data.Year > best.Data.Year {
+		var best *MemoryLane
+		for i := range lanes {
+			lane := &lanes[i]
+			if !hasServableImage(lane.Assets) {
+				continue
+			}
+			if best == nil || lane.Data.Year > best.Data.Year {
 				best = lane
 			}
+		}
+		if best == nil {
+			return nil, nil
 		}
 		return best.Assets, nil
 	}
@@ -256,6 +264,29 @@ func (c *Client) GetMemoryAssets(latestYearOnly bool) ([]Asset, error) {
 		out = append(out, lane.Assets...)
 	}
 	return out, nil
+}
+
+// IsServableImage reports whether an asset can be shown on the frame: an
+// IMAGE (not a video) that isn't a RAW file, since RAW has no usable
+// preview/thumbnail rendition.
+func IsServableImage(a Asset) bool {
+	if a.Type != "IMAGE" {
+		return false
+	}
+	switch strings.ToLower(filepath.Ext(a.OriginalFileName)) {
+	case ".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".orf", ".rw2":
+		return false
+	}
+	return true
+}
+
+func hasServableImage(assets []Asset) bool {
+	for _, a := range assets {
+		if IsServableImage(a) {
+			return true
+		}
+	}
+	return false
 }
 
 // getMemoryLanes performs one GET /api/memories request scoped to forDate.

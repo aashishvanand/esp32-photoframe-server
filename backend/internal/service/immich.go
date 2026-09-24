@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -274,11 +273,7 @@ func (s *ImmichService) FetchAlbumAssets(album model.Album) ([]RemoteAsset, erro
 	}
 	out := make([]RemoteAsset, 0, len(assets))
 	for _, a := range assets {
-		if a.Type != "IMAGE" {
-			continue
-		}
-		switch strings.ToLower(filepath.Ext(a.OriginalFileName)) {
-		case ".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".orf", ".rw2":
+		if !immich.IsServableImage(a) {
 			continue
 		}
 		w, h := a.ExifInfo.ExifImageWidth, a.ExifInfo.ExifImageHeight

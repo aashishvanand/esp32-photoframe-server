@@ -2,6 +2,7 @@ package immich
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -267,7 +268,8 @@ func TestGetMemoryAssets_LegacyDatetimeFallback(t *testing.T) {
 	}
 }
 
-// In latest-year mode only the most recent year's lane is returned.
+// In latest-year mode only the most recent year's lane is returned when it
+// has images; older lanes are ignored.
 func TestGetMemoryAssets_LatestYearOnly(t *testing.T) {
 	var gotFor, gotType string
 	srv := memoriesServer(t, &gotFor, &gotType)
@@ -284,5 +286,62 @@ func TestGetMemoryAssets_LatestYearOnly(t *testing.T) {
 	}
 	if assets[0].ID != "a2" || assets[1].ID != "a3" {
 		t.Errorf("got assets %v, want [a2 a3] from the 2024 lane", assets)
+	}
+}
+
+// lanesServer serves a fixed set of memory lanes from /api/memories.
+func lanesServer(t *testing.T, lanes []MemoryLane) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(lanes)
+	}))
+}
+
+func memoryLane(year int, assets ...Asset) MemoryLane {
+	lane := MemoryLane{ID: fmt.Sprintf("lane-%d", year), Assets: assets}
+	lane.Data.Year = year
+	return lane
+}
+
+// A newest year holding only videos (or RAW files) can't be shown, so latest
+// mode must fall back to the next most recent year with a servable image
+// instead of returning nothing — see issue #48.
+func TestGetMemoryAssets_LatestYearSkipsVideoOnlyYear(t *testing.T) {
+	srv := lanesServer(t, []MemoryLane{
+		memoryLane(2022, Asset{ID: "a1", Type: "IMAGE"}),
+		memoryLane(2025, Asset{ID: "v1", Type: "VIDEO"}),
+		memoryLane(2024, Asset{ID: "a2", Type: "IMAGE"}, Asset{ID: "v2", Type: "VIDEO"}),
+		memoryLane(2023, Asset{ID: "r1", Type: "IMAGE", OriginalFileName: "IMG_1.CR2"}),
+	})
+	defer srv.Close()
+
+	assets, err := newTestClient(srv.URL).GetMemoryAssets(true)
+	if err != nil {
+		t.Fatalf("GetMemoryAssets: %v", err)
+	}
+	// 2025 is video-only, so the 2024 lane is picked (its video is filtered
+	// later, alongside every other source).
+	if len(assets) != 2 || assets[0].ID != "a2" || assets[1].ID != "v2" {
+		t.Errorf("got assets %v, want [a2 v2] from the 2024 lane", assets)
+	}
+}
+
+// When no year has a servable image, latest mode returns an empty result
+// rather than an error.
+func TestGetMemoryAssets_LatestYearNoImages(t *testing.T) {
+	srv := lanesServer(t, []MemoryLane{
+		memoryLane(2025, Asset{ID: "v1", Type: "VIDEO"}),
+		memoryLane(2024),
+		memoryLane(2023, Asset{ID: "r1", Type: "IMAGE", OriginalFileName: "IMG_1.dng"}),
+	})
+	defer srv.Close()
+
+	assets, err := newTestClient(srv.URL).GetMemoryAssets(true)
+	if err != nil {
+		t.Fatalf("GetMemoryAssets: %v", err)
+	}
+	if len(assets) != 0 {
+		t.Errorf("got assets %v, want none", assets)
 	}
 }
