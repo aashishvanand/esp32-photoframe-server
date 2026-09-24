@@ -128,6 +128,28 @@ export const setDeviceHttpPassword = async (
   return response.data;
 };
 
+// Changes the password on the frame itself (unlike setDeviceHttpPassword,
+// which only records one the frame already has). The server signs in to the
+// frame with the stored password, sets the new one there and then stores it.
+// "" turns the frame's password off. On failure nothing is changed.
+// host is the one the user sees; the server refuses if the saved host has
+// since been changed elsewhere, rather than change another frame.
+export const changeFramePassword = async (
+  id: number,
+  password: string,
+  host: string
+): Promise<{
+  http_password_set: boolean;
+  verified: boolean;
+  warning?: string;
+}> => {
+  const response = await api.post(`/devices/${id}/frame-password`, {
+    password,
+    host,
+  });
+  return response.data;
+};
+
 // Updates server-owned + shared fields only. Dimensions / board name come
 // from refreshDevice(); device-side config (including the shared copy of
 // name + orientation) is synced via updateDeviceConfig().

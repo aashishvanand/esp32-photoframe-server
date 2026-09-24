@@ -115,6 +115,105 @@ func (h *DeviceHandler) SetHTTPPassword(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]bool{"http_password_set": req.HTTPPassword != ""})
 }
 
+// ChangeFramePassword changes the password on the frame itself -- unlike
+// SetHTTPPassword, which only records one the frame already has -- and then
+// stores it so the server keeps talking to the frame. An empty password turns
+// the frame's password off. If the frame does not take it, the stored
+// password is left as it was.
+//
+// Frame-side failures never answer 401: the webapp reads a 401 as its own
+// session expiring and logs the user out.
+//
+// POST /api/devices/:id/frame-password
+func (h *DeviceHandler) ChangeFramePassword(c echo.Context) error {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		return respondError(c, http.StatusBadRequest, "invalid device id")
+	}
+	var req struct {
+		Password *string `json:"password"`
+		// The host the user saw when asking; optional.
+		Host string `json:"host"`
+	}
+	if err := c.Bind(&req); err != nil || req.Password == nil {
+		return respondError(c, http.StatusBadRequest, "invalid request")
+	}
+	if err := photoframe.ValidateHTTPPassword(*req.Password); err != nil {
+		return respondError(c, http.StatusBadRequest, err.Error())
+	}
+
+	verified, err := h.deviceService.ChangeFramePassword(uint(id), *req.Password, req.Host)
+	if err != nil {
+		var fpe *service.FramePasswordError
+		var fse *service.FramePasswordStoreError
+		switch {
+		case errors.Is(err, service.ErrDeviceNotFound):
+			return respondError(c, http.StatusNotFound, "device not found")
+		case errors.Is(err, service.ErrFrameHostChanged):
+			return respondError(c, http.StatusConflict,
+				"This device's host was changed elsewhere since the dialog was opened. Nothing was changed; reopen the device and try again.")
+		case errors.As(err, &fpe):
+			status, msg := framePasswordErrorResponse(fpe)
+			if fpe.Kind == service.FrameLockedOut && fpe.RetryAfter != "" {
+				c.Response().Header().Set("Retry-After", fpe.RetryAfter)
+			}
+			return respondError(c, status, msg)
+		case errors.As(err, &fse):
+			return respondError(c, http.StatusInternalServerError,
+				"The frame now uses the new password, but the server could not save it ("+fse.Err.Error()+"). "+
+					"Enter the new password under \"Frame password\" and save, or the server cannot reach the frame.")
+		}
+		return respondError(c, http.StatusInternalServerError, err.Error())
+	}
+
+	resp := map[string]interface{}{
+		"http_password_set": *req.Password != "",
+		"verified":          verified,
+	}
+	if !verified {
+		resp["warning"] = "The frame accepted the change, but reading its settings back with the new password did not confirm it. " +
+			"The server now uses the new password; check the frame from its own web page."
+	}
+	return c.JSON(http.StatusOK, resp)
+}
+
+// framePasswordErrorResponse turns a refused frame password change into a
+// status and a message the webapp shows as is. Every message says what the
+// stored password is now, because that is what the user most needs to know.
+func framePasswordErrorResponse(e *service.FramePasswordError) (int, string) {
+	const unchanged = " Nothing was changed."
+	switch e.Kind {
+	case service.FrameNoHost:
+		return http.StatusBadRequest, "This device has no host, so the server cannot reach the frame." + unchanged
+	case service.FrameWrongPassword:
+		// 409, not 401: see ChangeFramePassword.
+		msg := "The frame rejected the password this server has for it, so it would not accept a new one."
+		if e.NoneStored {
+			msg = "The frame already requires a password, and this server has none stored for it."
+		}
+		return http.StatusConflict, msg + unchanged +
+			" Enter the frame's current password under \"Frame password\" and save, then try again."
+	case service.FrameLockedOut:
+		msg := "The frame is refusing password attempts from this server after too many wrong ones."
+		if e.RetryAfter != "" {
+			msg += " Try again in " + e.RetryAfter + " seconds."
+		} else {
+			msg += " Try again later."
+		}
+		return http.StatusTooManyRequests, msg + unchanged
+	case service.FrameRefused:
+		return http.StatusBadGateway, "The frame refused the change: " + e.Err.Error() + "." + unchanged
+	case service.FrameOutcomeUnknown:
+		// Not "Nothing was changed": that may be false here.
+		return http.StatusGatewayTimeout, "The frame stopped answering during the change, so it is not known whether it now has the new password. " +
+			"The server still uses the old one. If the frame no longer responds to the server, enter the new password under \"Frame password\" and save."
+	case service.FrameUnsupported:
+		return http.StatusBadGateway, "The frame's firmware does not support a password. Update the firmware first." + unchanged
+	default:
+		return http.StatusBadGateway, "Could not reach the frame: " + e.Err.Error() + "." + unchanged
+	}
+}
+
 // PUT /api/devices/:id
 // Updates server-owned + shared fields only. Dimensions / board name
 // come from POST /api/devices/:id/refresh.

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -115,6 +116,19 @@ type Client struct {
 // longer value here would never match.
 const MaxHTTPPasswordLen = 63
 
+// ValidateHTTPPassword reports why the firmware could not store password as
+// given: too long (it would be refused), or holding a NUL byte (it would keep
+// only what comes before it, so the full value would never match).
+func ValidateHTTPPassword(password string) error {
+	if len(password) > MaxHTTPPasswordLen {
+		return fmt.Errorf("frame password must be at most %d bytes", MaxHTTPPasswordLen)
+	}
+	if strings.IndexByte(password, 0) >= 0 {
+		return errors.New("frame password must not contain a NUL character")
+	}
+	return nil
+}
+
 func NewClient(host string) *Client {
 	return NewClientWithPassword(host, "")
 }
@@ -218,9 +232,26 @@ func (c *Client) resolveHost(host string) (string, error) {
 		return c.resolvedIP, nil
 	}
 
-	// If it's already an IP, cache and return it
+	// A host with an explicit port ("192.168.1.10:8080") resolves its name
+	// and keeps the port. A bare IPv6 literal fails to split and is used whole.
+	name, port, err := net.SplitHostPort(host)
+	if err != nil {
+		name, port = host, ""
+	}
+	ip, err := lookupIP(name)
+	if err != nil {
+		return "", err
+	}
+	if port != "" {
+		ip = net.JoinHostPort(ip, port)
+	}
+	c.resolvedIP = ip
+	return ip, nil
+}
+
+func lookupIP(host string) (string, error) {
+	// If it's already an IP, return it
 	if net.ParseIP(host) != nil {
-		c.resolvedIP = host
 		return host, nil
 	}
 
@@ -228,7 +259,6 @@ func (c *Client) resolveHost(host string) (string, error) {
 	// (Go's net.LookupHost has a 5s timeout trying regular DNS first)
 	if strings.HasSuffix(host, ".local") && runtime.GOOS == "darwin" {
 		if ip, err := resolveMDNSDarwin(host); err == nil {
-			c.resolvedIP = ip
 			return ip, nil
 		}
 		// Fall through to standard resolver
@@ -242,14 +272,12 @@ func (c *Client) resolveHost(host string) (string, error) {
 	// Prefer IPv4
 	for _, ip := range ips {
 		if strings.Contains(ip, ".") {
-			c.resolvedIP = ip
 			return ip, nil
 		}
 	}
 
 	// Fallback to first (likely IPv6)
 	if len(ips) > 0 {
-		c.resolvedIP = ips[0]
 		return ips[0], nil
 	}
 
@@ -292,11 +320,12 @@ func resolveMDNSDarwin(host string) (string, error) {
 
 func (c *Client) checkReachability(ip string) error {
 	target := ip
-	if !strings.Contains(target, ":") {
+	if _, _, err := net.SplitHostPort(target); err != nil {
 		target = net.JoinHostPort(target, "80")
 	}
 
-	conn, err := net.DialTimeout("tcp4", target, 2*time.Second)
+	// "tcp", not "tcp4": resolveHost can return an IPv6 address.
+	conn, err := net.DialTimeout("tcp", target, 2*time.Second)
 	if err != nil {
 		return err
 	}
@@ -419,7 +448,7 @@ func (c *Client) FetchConfig() (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("device returned status: %d", resp.StatusCode)
+		return "", newStatusError(resp)
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -553,6 +582,76 @@ func (c *Client) PushConfig(config map[string]interface{}) error {
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("device returned status: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// StatusError is a non-200 answer from the frame. Error() keeps the
+// "device returned status: N" wording the other calls use; callers that need
+// to tell a rejected password (401) or a lockout (429) apart use errors.As.
+type StatusError struct {
+	StatusCode int
+	// RetryAfter is the frame's Retry-After header on a 429, in seconds.
+	RetryAfter string
+	// Message is the frame's own explanation, when its body carried one
+	// ({"message": ...} from a rejected config, {"error": ...} from the
+	// password gate).
+	Message string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("device returned status: %d", e.StatusCode)
+}
+
+func newStatusError(resp *http.Response) *StatusError {
+	e := &StatusError{StatusCode: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After")}
+	var body struct {
+		Message string `json:"message"`
+		Error   string `json:"error"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&body) == nil {
+		e.Message = body.Message
+		if e.Message == "" {
+			e.Message = body.Error
+		}
+	}
+	return e
+}
+
+// PatchConfig sends a partial config update: fields left out keep their
+// value on the frame. Unlike PushConfig's POST, which callers use with a full
+// config, this is for changing one setting on its own -- in particular the
+// frame's HTTP password, which the frame accepts only here, from a client
+// that authenticated with the current one.
+func (c *Client) PatchConfig(fields map[string]interface{}) error {
+	ip, err := c.resolveHost(c.host)
+	if err != nil {
+		return fmt.Errorf("failed to resolve device %s: %w", c.host, err)
+	}
+
+	url := fmt.Sprintf("http://%s/api/config", ip)
+
+	jsonData, err := json.Marshal(fields)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	req, err := http.NewRequest("PATCH", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	req.Host = c.host
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return newStatusError(resp)
 	}
 
 	return nil

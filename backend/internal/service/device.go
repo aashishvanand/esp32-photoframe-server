@@ -64,6 +64,7 @@ func (s *DeviceService) ListDevices() ([]model.Device, error) {
 // already long, and a write-only secret does not belong in a payload the UI
 // round-trips.
 func (s *DeviceService) SetHTTPPassword(id uint, password string) error {
+	defer holdFrameCreds(id)()
 	res := s.db.Model(&model.Device{}).Where("id = ?", id).
 		Update("http_password", password)
 	if res.Error != nil {
@@ -180,6 +181,8 @@ func (s *DeviceService) AddDevice(host, httpPassword string, enableCollage, show
 // DeviceProcessingSettings, DeviceColorPalette) are only written by
 // AddDevice and RefreshDeviceFromHardware.
 func (s *DeviceService) UpdateDevice(id uint, name, host, orientation string, enableCollage, showDate, showPhotoDate, showWeather bool, weatherLat, weatherLon float64, aiProvider, aiModel, aiPrompt string, layout string, displayMode string, showCalendar bool, calendarID string, dateFormat string) (*model.Device, error) {
+	// It may change the host: not in the middle of a frame password change.
+	defer holdFrameCreds(id)()
 	var device model.Device
 	if err := s.db.First(&device, id).Error; err != nil {
 		return nil, errors.New("device not found")
@@ -216,7 +219,9 @@ func (s *DeviceService) UpdateDevice(id uint, name, host, orientation string, en
 	device.CalendarID = calendarID
 	device.DateFormat = dateFormat
 
-	if err := s.db.Save(&device).Error; err != nil {
+	// The password is only written by SetHTTPPassword and ChangeFramePassword;
+	// saving the copy loaded above could undo a change made meanwhile.
+	if err := s.db.Omit("http_password").Save(&device).Error; err != nil {
 		return nil, err
 	}
 	return &device, nil
@@ -232,7 +237,13 @@ func (s *DeviceService) RefreshDeviceFromHardware(id uint) (*model.Device, error
 		return nil, errors.New("device not found")
 	}
 
-	pfClient := photoframe.NewClientWithPassword(device.Host, device.HTTPPassword)
+	// Held to the end, Save included: a frame password change waits for it.
+	// At the loaded host: the data fetched is saved onto that row.
+	pfClient, release, err := FrameClientAt(s.db, id, device.Host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch from device: %w", err)
+	}
+	defer release()
 
 	sysInfo, err := pfClient.FetchSystemInfo()
 	if err != nil {
@@ -274,13 +285,18 @@ func (s *DeviceService) RefreshDeviceFromHardware(id uint) (*model.Device, error
 		device.DeviceColorPalette = paletteRaw
 	}
 
-	if err := s.db.Save(&device).Error; err != nil {
+	// Refresh writes neither the password nor the host; saving the copies
+	// loaded above could undo an edit made meanwhile.
+	if err := s.db.Omit("http_password", "host").Save(&device).Error; err != nil {
 		return nil, err
 	}
 	return &device, nil
 }
 
 func (s *DeviceService) DeleteDevice(id uint) error {
+	// Not in the middle of a frame password change, whose result would
+	// then have nowhere to be stored.
+	defer holdFrameCreds(id)()
 	// device_histories, device_album_mappings, device_url_mappings and
 	// generative_states are removed automatically via ON DELETE CASCADE
 	// (migration 000032, enforced by _foreign_keys=on) — Device has no
@@ -323,8 +339,12 @@ func (s *DeviceService) PushToHost(device *model.Device, imagePath string, extra
 	}
 
 	// Always fetch system info for firmware version check
-	pfClient := photoframe.NewClientWithPassword(device.Host, device.HTTPPassword)
-	sysInfo, sysInfoErr := pfClient.FetchSystemInfo()
+	pfClient, release, sysInfoErr := FrameClientAt(s.db, device.ID, device.Host)
+	var sysInfo *photoframe.SystemInfo
+	if sysInfoErr == nil {
+		sysInfo, sysInfoErr = pfClient.FetchSystemInfo()
+		release()
+	}
 	if sysInfoErr != nil {
 		log.Printf("Failed to fetch system info for %s: %v", device.Name, sysInfoErr)
 	}
@@ -504,6 +524,14 @@ func (s *DeviceService) PushToHost(device *model.Device, imagePath string, extra
 		return fmt.Errorf("processing failed: %w", err)
 	}
 
+	// A fresh client, not the one above: the frame's password may have been
+	// changed while the image was being rendered. Same host, though: the
+	// image was rendered for the frame there.
+	pfClient, release, err = FrameClientAt(s.db, device.ID, device.Host)
+	if err != nil {
+		return fmt.Errorf("failed to push to device: %w", err)
+	}
+	defer release()
 	if err := pfClient.PushImage(processedData, thumbData); err != nil {
 		return fmt.Errorf("failed to push to device: %w", err)
 	}

@@ -590,6 +590,21 @@ func (h *ImageHandler) UpdateDeviceConfig(c echo.Context) error {
 		return respondError(c, http.StatusBadRequest, "invalid request")
 	}
 
+	var configMap map[string]interface{}
+	if len(req.Config) > 0 {
+		json.Unmarshal(req.Config, &configMap)
+	}
+	// The frame password changes only through POST
+	// /devices/:id/frame-password, which keeps the stored one in step. Here
+	// the direct push below would change it on the frame behind the server's
+	// back and lock the server out. Refused rather than dropped, before
+	// anything is stored: a silently emptied edit would still advance the
+	// sync timestamp.
+	if _, ok := configMap["http_password"]; ok {
+		return respondError(c, http.StatusBadRequest,
+			"http_password cannot be set through the device config; use POST /api/devices/:id/frame-password")
+	}
+
 	updates := map[string]interface{}{
 		"config_last_updated": time.Now().Unix(),
 	}
@@ -606,10 +621,6 @@ func (h *ImageHandler) UpdateDeviceConfig(c echo.Context) error {
 	h.db.Model(&device).Updates(updates)
 
 	// If image_url points to this server, ensure a device token is included
-	var configMap map[string]interface{}
-	if len(req.Config) > 0 {
-		json.Unmarshal(req.Config, &configMap)
-	}
 	if configMap != nil {
 		// Matches the unified bare "/image", the legacy "/image/<source>",
 		// and any "/image?..." query form.
@@ -641,20 +652,7 @@ func (h *ImageHandler) UpdateDeviceConfig(c echo.Context) error {
 	// sync path.
 	pushResult := "synced"
 	if device.Host != "" && configMap != nil {
-		client := photoframe.NewClientWithPassword(device.Host, device.HTTPPassword)
-		pushOK := true
-		if len(req.ProcessingSettings) > 0 {
-			if err := client.PushProcessingSettings(req.ProcessingSettings); err != nil {
-				log.Printf("Could not push processing settings to device %s: %v (will sync on next image fetch)", device.Host, err)
-				pushOK = false
-			}
-		}
-		if !pushOK {
-			pushResult = "offline"
-		} else if err := client.PushConfig(configMap); err != nil {
-			log.Printf("Could not push config to device %s: %v (will sync on next image fetch)", device.Host, err)
-			pushResult = "offline"
-		}
+		pushResult = h.pushDeviceConfig(device, req.ProcessingSettings, configMap)
 	}
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
@@ -662,6 +660,32 @@ func (h *ImageHandler) UpdateDeviceConfig(c echo.Context) error {
 		"push_result":         pushResult,
 		"config_last_updated": updates["config_last_updated"],
 	})
+}
+
+// pushDeviceConfig pushes an edit straight to the device and reports
+// "synced", or "offline" when it has to wait for the next image fetch.
+func (h *ImageHandler) pushDeviceConfig(device model.Device, processingSettings json.RawMessage, configMap map[string]interface{}) string {
+	// Holds the stored password in place until the push is done, so a
+	// concurrent frame password change cannot slip in between.
+	// At the host loaded with the edit: if it was changed meanwhile, the
+	// deferred sync delivers the edit to whichever frame is this device.
+	client, release, err := service.FrameClientAt(h.db, device.ID, device.Host)
+	if err != nil {
+		log.Printf("Could not push config to device %d: %v (will sync on next image fetch)", device.ID, err)
+		return "offline"
+	}
+	defer release()
+	if len(processingSettings) > 0 {
+		if err := client.PushProcessingSettings(processingSettings); err != nil {
+			log.Printf("Could not push processing settings to device %s: %v (will sync on next image fetch)", device.Host, err)
+			return "offline"
+		}
+	}
+	if err := client.PushConfig(configMap); err != nil {
+		log.Printf("Could not push config to device %s: %v (will sync on next image fetch)", device.Host, err)
+		return "offline"
+	}
+	return "synced"
 }
 
 // GetDeviceConfig returns the server-side device config.
@@ -801,9 +825,16 @@ func (h *ImageHandler) pullDeviceConfigAsync(device model.Device, deviceTS int64
 		return
 	}
 	go func() {
-		client := photoframe.NewClientWithPassword(device.Host, device.HTTPPassword)
 		deadline := time.Now().Add(postRotateWaitSec * time.Second)
 		for {
+			// A client per attempt, with the password stored at that moment:
+			// the frame's password may be changed while this loop waits. The
+			// host stays the one that asked, whose timestamp this pull is for.
+			client, release, cerr := service.FrameClientAt(h.db, device.ID, device.Host)
+			if cerr != nil {
+				log.Printf("Config sync: not pulling config for device %d: %v", device.ID, cerr)
+				return
+			}
 			configRaw, err := client.FetchConfig()
 			if err == nil {
 				updates := map[string]interface{}{
@@ -816,6 +847,7 @@ func (h *ImageHandler) pullDeviceConfigAsync(device model.Device, deviceTS int64
 				if palette, perr := client.FetchPalette(); perr == nil {
 					updates["device_color_palette"] = palette
 				}
+				release()
 				var parsed struct {
 					DisplayOrientation string `json:"display_orientation"`
 				}
@@ -827,6 +859,14 @@ func (h *ImageHandler) pullDeviceConfigAsync(device model.Device, deviceTS int64
 				} else {
 					log.Printf("Config sync: pulled newer config from device %s (ts=%d)", device.Host, deviceTS)
 				}
+				return
+			}
+			release()
+			// A rejected password stays rejected, and every retry would spend
+			// another of the frame's free wrong guesses.
+			if service.IsFrameAuthError(err) {
+				log.Printf("Config sync: device %s refused the stored password, not pulling its config: %v",
+					device.Host, err)
 				return
 			}
 			if time.Now().After(deadline) {

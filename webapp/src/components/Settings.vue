@@ -1264,31 +1264,6 @@
                               hide-details
                             ></v-text-field>
                           </v-col>
-                          <v-col cols="12" md="6">
-                            <v-text-field
-                              v-model="deviceHttpPassword"
-                              :label="
-                                editingDevice.http_password_set
-                                  ? 'Frame password (set — blank keeps it)'
-                                  : 'Frame password (only if enabled on the frame)'
-                              "
-                              type="password"
-                              maxlength="63"
-                              variant="outlined"
-                              density="compact"
-                              hint="Needed only when the frame requires a password for its own web interface."
-                              persistent-hint
-                            ></v-text-field>
-                            <v-btn
-                              v-if="editingDevice.http_password_set"
-                              size="small"
-                              variant="text"
-                              color="error"
-                              class="mt-1"
-                              @click="clearDeviceHttpPassword"
-                              >Forget password</v-btn
-                            >
-                          </v-col>
                         </v-row>
                         <v-row>
                           <v-col cols="12" md="6">
@@ -1420,6 +1395,165 @@
                                     "
                                     persistent-hint
                                   ></v-text-field>
+                                </v-col>
+                              </v-row>
+                              <!-- Frame password (#130), where the frame's own web
+                                   interface keeps it. Two different things: the
+                                   field records the password the frame already
+                                   has; the card below changes the frame itself. -->
+                              <div class="text-subtitle-2 mt-6">
+                                Frame password
+                              </div>
+                              <v-row>
+                                <v-col cols="12" md="6">
+                                  <v-text-field
+                                    v-model="deviceHttpPassword"
+                                    :label="
+                                      editingDevice.http_password_set
+                                        ? 'Frame password (set — blank keeps it)'
+                                        : 'Frame password (only if enabled on the frame)'
+                                    "
+                                    type="password"
+                                    maxlength="63"
+                                    variant="outlined"
+                                    density="compact"
+                                    hint="The password the frame already has, so this server can reach it. Saving it here does not change the frame."
+                                    persistent-hint
+                                  ></v-text-field>
+                                  <v-btn
+                                    v-if="editingDevice.http_password_set"
+                                    size="small"
+                                    variant="text"
+                                    color="error"
+                                    class="mt-1"
+                                    :disabled="framePasswordBusy"
+                                    @click="clearDeviceHttpPassword"
+                                    >Forget password</v-btn
+                                  >
+                                </v-col>
+                              </v-row>
+                              <!-- Changes the frame itself, unlike the field above,
+                                   which only tells this server what the frame has. -->
+                              <v-row>
+                                <v-col cols="12">
+                                  <v-card variant="outlined" class="pa-3">
+                                    <div class="text-subtitle-2">
+                                      Password on the frame
+                                    </div>
+                                    <div
+                                      class="text-body-2 text-medium-emphasis"
+                                    >
+                                      {{
+                                        editingDevice.http_password_set
+                                          ? 'Changes the password the frame itself requires.'
+                                          : 'Makes the frame itself require a password.'
+                                      }}
+                                      The server signs in to the frame with the
+                                      password it has stored, sets the new one
+                                      on the frame, then stores that too. If the
+                                      frame does not accept it, nothing changes.
+                                    </div>
+                                    <div
+                                      v-if="framePasswordHostUnsaved"
+                                      class="text-caption text-warning mt-2"
+                                    >
+                                      Save the new Host / IP first: this acts on
+                                      the frame at the saved address.
+                                    </div>
+                                    <div
+                                      v-if="framePasswordTypedUnsaved"
+                                      class="text-caption text-warning mt-2"
+                                    >
+                                      Save the password typed above first: the
+                                      server signs in to the frame with the
+                                      saved one.
+                                    </div>
+                                    <div
+                                      v-if="!framePasswordFormOpen"
+                                      class="d-flex flex-wrap ga-2 mt-2"
+                                    >
+                                      <v-btn
+                                        size="small"
+                                        variant="tonal"
+                                        :disabled="
+                                          framePasswordBusy ||
+                                          !framePasswordReady
+                                        "
+                                        @click="openFramePasswordForm"
+                                        >{{
+                                          editingDevice.http_password_set
+                                            ? 'Change password on the frame'
+                                            : 'Set a password on the frame'
+                                        }}</v-btn
+                                      >
+                                      <v-btn
+                                        v-if="editingDevice.http_password_set"
+                                        size="small"
+                                        variant="tonal"
+                                        color="error"
+                                        :loading="framePasswordBusy"
+                                        :disabled="!framePasswordReady"
+                                        @click="turnOffFramePassword"
+                                        >Turn off password on the frame</v-btn
+                                      >
+                                    </div>
+                                    <div v-else class="mt-2">
+                                      <v-row dense>
+                                        <v-col cols="12" md="6">
+                                          <v-text-field
+                                            v-model="newFramePassword"
+                                            label="New frame password"
+                                            type="password"
+                                            autocomplete="new-password"
+                                            variant="outlined"
+                                            density="compact"
+                                            hide-details="auto"
+                                          ></v-text-field>
+                                        </v-col>
+                                        <v-col cols="12" md="6">
+                                          <v-text-field
+                                            v-model="newFramePasswordRepeat"
+                                            label="Repeat new frame password"
+                                            type="password"
+                                            autocomplete="new-password"
+                                            variant="outlined"
+                                            density="compact"
+                                            hide-details="auto"
+                                            :error-messages="
+                                              framePasswordTouched
+                                                ? framePasswordProblem || []
+                                                : []
+                                            "
+                                          ></v-text-field>
+                                        </v-col>
+                                      </v-row>
+                                      <div class="d-flex flex-wrap ga-2 mt-2">
+                                        <v-btn
+                                          size="small"
+                                          color="primary"
+                                          :loading="framePasswordBusy"
+                                          :disabled="!framePasswordReady"
+                                          @click="applyFramePassword"
+                                          >Change on the frame</v-btn
+                                        >
+                                        <v-btn
+                                          size="small"
+                                          variant="text"
+                                          :disabled="framePasswordBusy"
+                                          @click="closeFramePasswordForm"
+                                          >Cancel</v-btn
+                                        >
+                                      </div>
+                                    </div>
+                                    <v-alert
+                                      v-if="framePasswordNote"
+                                      :type="framePasswordNote.type"
+                                      variant="tonal"
+                                      density="compact"
+                                      class="mt-3"
+                                      >{{ framePasswordNote.text }}</v-alert
+                                    >
+                                  </v-card>
                                 </v-col>
                               </v-row>
                             </v-expansion-panel-text>
@@ -2352,6 +2486,7 @@
                       color="primary"
                       @click="saveDevice"
                       :loading="savingDeviceConfig"
+                      :disabled="framePasswordBusy"
                       >{{ isAddingDevice ? 'Add' : 'Save' }}</v-btn
                     >
                   </v-card-actions>
@@ -2383,6 +2518,7 @@ import {
   deleteDevice,
   updateDevice,
   setDeviceHttpPassword,
+  changeFramePassword,
   refreshDevice,
   type Device,
   createURLSource,
@@ -2397,6 +2533,8 @@ import {
 } from '../api';
 import Gallery from './Gallery.vue';
 import ConfirmDialog from './ConfirmDialog.vue';
+import { newFramePasswordProblem } from '../utils/framePassword';
+import { getApiError } from '../utils/errors';
 import AlbumPicker from './AlbumPicker.vue';
 import TopicManager from './TopicManager.vue';
 import SecurityTab from './SecurityTab.vue';
@@ -2492,7 +2630,152 @@ async function clearDeviceHttpPassword() {
   );
   if (listed) listed.http_password_set = false;
   deviceHttpPassword.value = '';
-  showMessage('Forgot the stored frame password.');
+  showMessage(
+    'Forgot the stored frame password. The frame itself still has it.'
+  );
+}
+
+// "Password on the frame": changes the frame itself, through the server.
+const framePasswordFormOpen = ref(false);
+const newFramePassword = ref('');
+const newFramePasswordRepeat = ref('');
+// Mismatch errors only once the user has tried to apply, not while typing.
+const framePasswordTouched = ref(false);
+const framePasswordBusy = ref(false);
+const framePasswordNote = ref<{
+  type: 'success' | 'warning' | 'error';
+  text: string;
+} | null>(null);
+// The server acts on the device's SAVED host. With an unsaved edit of the
+// Host field, the action would hit a different frame than the one shown.
+const framePasswordHostUnsaved = computed(() => {
+  const saved = availableDevices.value.find(
+    (d: Device) => d.id === editingDevice.id
+  );
+  return !!saved && saved.host !== editingDevice.host;
+});
+// A password typed into "Frame password" but not saved yet: the change
+// would sign in with the old stored one instead (a likely wrong guess
+// against the frame), and a later Save would overwrite the new one.
+const framePasswordTypedUnsaved = computed(
+  () => deviceHttpPassword.value !== ''
+);
+// Not while the dialog is saving either: its Save may store a typed
+// password, which must not interleave with a change on the frame. (Save is
+// disabled during a change, for the same reason.)
+const framePasswordReady = computed(
+  () =>
+    !!editingDevice.host &&
+    !framePasswordHostUnsaved.value &&
+    !framePasswordTypedUnsaved.value &&
+    !savingDeviceConfig.value
+);
+const framePasswordProblem = computed(() =>
+  newFramePasswordProblem(newFramePassword.value, newFramePasswordRepeat.value)
+);
+
+// Bumped each time the dialog opens on a device, so a request still in
+// flight from an earlier opening -- of this device or another -- leaves the
+// new one alone.
+let framePasswordGeneration = 0;
+
+function resetFramePasswordState() {
+  framePasswordBusy.value = false;
+  framePasswordFormOpen.value = false;
+  newFramePassword.value = '';
+  newFramePasswordRepeat.value = '';
+  framePasswordTouched.value = false;
+  framePasswordNote.value = null;
+}
+
+function openFramePasswordForm() {
+  resetFramePasswordState();
+  framePasswordFormOpen.value = true;
+}
+
+function closeFramePasswordForm() {
+  const note = framePasswordNote.value;
+  resetFramePasswordState();
+  framePasswordNote.value = note;
+}
+
+async function sendFramePassword(password: string) {
+  // The dialog can be closed and reopened while this is in flight: the
+  // result belongs to the device it was sent for, and to that opening.
+  const deviceId = editingDevice.id;
+  if (!deviceId) return false;
+  const generation = framePasswordGeneration;
+  const stillOpen = () => framePasswordGeneration === generation;
+  framePasswordBusy.value = true;
+  framePasswordNote.value = null;
+  try {
+    const res = await changeFramePassword(
+      deviceId,
+      password,
+      editingDevice.host ?? ''
+    );
+    if (!stillOpen()) {
+      // A later opening may have changed it again since: ask the server,
+      // which saw the changes in order, rather than trust this result.
+      await loadDevices();
+      // And if that later opening is of this same device, its flag too.
+      const fresh = availableDevices.value.find(
+        (d: Device) => d.id === deviceId
+      );
+      if (fresh && editingDevice.id === deviceId) {
+        editingDevice.http_password_set = fresh.http_password_set;
+      }
+      return false;
+    }
+    const listed = availableDevices.value.find(
+      (d: Device) => d.id === deviceId
+    );
+    if (listed) listed.http_password_set = res.http_password_set;
+    editingDevice.http_password_set = res.http_password_set;
+    const others =
+      password === ''
+        ? 'The frame no longer requires a password. The Home Assistant integration and the mobile app keep working; you can remove the password from them.'
+        : 'Give the new password to the Home Assistant integration and the mobile app too, or they can no longer reach the frame.';
+    framePasswordNote.value = res.verified
+      ? { type: 'success', text: `Done. ${others}` }
+      : {
+          type: 'warning',
+          text: `${res.warning || 'The frame accepted the change, but it could not be confirmed.'} ${others}`,
+        };
+    return true;
+  } catch (e: unknown) {
+    if (stillOpen()) {
+      framePasswordNote.value = {
+        type: 'error',
+        text: getApiError(e, 'Could not change the password on the frame.'),
+      };
+    } else {
+      showMessage(
+        getApiError(e, 'Could not change the password on the frame.'),
+        true
+      );
+    }
+    return false;
+  } finally {
+    if (stillOpen()) framePasswordBusy.value = false;
+  }
+}
+
+async function applyFramePassword() {
+  framePasswordTouched.value = true;
+  if (framePasswordProblem.value) return;
+  // false as well when the dialog moved on to another device meanwhile.
+  const ok = await sendFramePassword(newFramePassword.value);
+  if (ok) closeFramePasswordForm();
+}
+
+async function turnOffFramePassword() {
+  const ok = await confirmDialog.value.open(
+    'The frame will no longer ask for a password: anyone on your network can then open its web page and change its settings. The server stops sending the password.',
+    'Turn off password on the frame?'
+  );
+  if (!ok) return;
+  await sendFramePassword('');
 }
 
 const selectedSource = ref('immich');
@@ -3271,6 +3554,8 @@ const editDevice = async (device: Device) => {
   isAddingDevice.value = false;
   // Never carry a half-typed password over from another device's dialog.
   deviceHttpPassword.value = '';
+  framePasswordGeneration++;
+  resetFramePasswordState();
   deviceDialogTab.value = 'general';
   showEditDeviceDialog.value = true;
   deviceImmichAlbumIds.value = [];
@@ -3608,6 +3893,16 @@ const saveDevice = async () => {
     savingDeviceConfig.value = false;
   }
 };
+
+// Closing the device dialog, however it opens next (another device, the
+// same one, or Add Device), leaves any frame password request still in
+// flight to the device list alone.
+watch(showEditDeviceDialog, (open) => {
+  if (!open) {
+    framePasswordGeneration++;
+    resetFramePasswordState();
+  }
+});
 
 const loadDevices = async () => {
   deviceListLoading.value = true;

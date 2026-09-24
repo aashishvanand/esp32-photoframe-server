@@ -1,8 +1,12 @@
 package photoframe
 
 import (
+	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -58,5 +62,83 @@ func TestPasswordNotForwardedOnRedirect(t *testing.T) {
 	}
 	if leaked {
 		t.Fatal("password was sent to the redirect target")
+	}
+}
+
+func TestPatchConfigSendsPartialUpdateWithCurrentPassword(t *testing.T) {
+	var gotMethod, gotPass, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		_, gotPass, _ = r.BasicAuth()
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Write([]byte(`{"status":"success"}`))
+	}))
+	defer srv.Close()
+
+	c := NewClientWithPassword(strings.TrimPrefix(srv.URL, "http://"), "current")
+	if err := c.PatchConfig(map[string]interface{}{"http_password": "next"}); err != nil {
+		t.Fatal(err)
+	}
+	if gotMethod != "PATCH" || gotPass != "current" || gotBody != `{"http_password":"next"}` {
+		t.Fatalf("got %s with password %q and body %s", gotMethod, gotPass, gotBody)
+	}
+}
+
+func TestStatusErrorCarriesRetryAfterAndMessage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "PATCH" {
+			w.Header().Set("Retry-After", "42")
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":"too many wrong passwords, try again later"}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"status":"error","message":"Device password is too long (max 63 bytes)"}`))
+	}))
+	defer srv.Close()
+	c := NewClient(strings.TrimPrefix(srv.URL, "http://"))
+
+	var se *StatusError
+	err := c.PatchConfig(map[string]interface{}{"http_password": "x"})
+	if !errors.As(err, &se) || se.StatusCode != 429 || se.RetryAfter != "42" ||
+		se.Message != "too many wrong passwords, try again later" {
+		t.Fatalf("PatchConfig error = %#v", err)
+	}
+	if err.Error() != "device returned status: 429" {
+		t.Fatalf("Error() = %q, want the usual wording", err.Error())
+	}
+
+	_, err = c.FetchConfig()
+	if !errors.As(err, &se) || se.StatusCode != 400 || se.Message != "Device password is too long (max 63 bytes)" {
+		t.Fatalf("FetchConfig error = %#v", err)
+	}
+}
+
+func TestResolveHostKeepsPort(t *testing.T) {
+	for host, want := range map[string]string{
+		"127.0.0.1":      "127.0.0.1",
+		"127.0.0.1:8080": "127.0.0.1:8080",
+		"[::1]:8080":     "[::1]:8080",
+		"::1":            "::1",
+	} {
+		got, err := NewClient(host).resolveHost(host)
+		if err != nil || got != want {
+			t.Errorf("resolveHost(%q) = %q, %v; want %q", host, got, err, want)
+		}
+	}
+}
+
+func TestCheckReachabilityIPv6(t *testing.T) {
+	srv := httptest.NewUnstartedServer(http.NotFoundHandler())
+	l, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skip("no IPv6 loopback")
+	}
+	srv.Listener = l
+	srv.Start()
+	defer srv.Close()
+	if err := NewClient("").checkReachability(l.Addr().String()); err != nil {
+		t.Fatalf("checkReachability(%s): %v", l.Addr(), err)
 	}
 }
