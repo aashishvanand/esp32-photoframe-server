@@ -278,19 +278,56 @@ func (s *SynologyService) isAuthExpired(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "code: 119")
 }
 
+// Page sizes and safety bounds for DSM list calls. DSM pages with
+// offset/limit and gives no total, so a listing ends at the first short page;
+// the bounds only stop a server that keeps returning full pages (e.g. one that
+// ignores offset) from looping forever. See issue #56.
+const (
+	synologyAlbumPageSize = 100
+	// synologyMaxAlbumPages caps an album listing at 10,000 albums.
+	synologyMaxAlbumPages = 100
+	synologyPhotoPageSize = 500
+	// synologyMaxAlbumPhotos caps a single album's photo listing.
+	synologyMaxAlbumPhotos = 100000
+)
+
+// pageSynology calls fetch with increasing offsets until it returns a short
+// page, or until maxPages full pages have been read, in which case the result
+// is truncated and a warning names what was cut off.
+func pageSynology[T any](what string, pageSize, maxPages int, fetch func(offset, limit int) ([]T, error)) ([]T, error) {
+	var all []T
+	for page := 0; page < maxPages; page++ {
+		batch, err := fetch(page*pageSize, pageSize)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, batch...)
+		if len(batch) < pageSize {
+			return all, nil
+		}
+	}
+	log.Printf("synology: %s: stopped after %d pages (%d items); the rest is not listed",
+		what, maxPages, len(all))
+	return all, nil
+}
+
 func (s *SynologyService) ListAlbums() ([]synology.Album, error) {
 	if err := s.ensureClient("", false); err != nil {
 		return nil, err
 	}
 
-	gen := s.loginGeneration()
-	albums, err := s.client.ListAlbums(0, 100)
-	if s.isAuthExpired(err) {
-		if reErr := s.relogin(gen); reErr != nil {
-			return nil, errors.New("authentication expired and re-login failed: " + reErr.Error())
-		}
-		albums, err = s.client.ListAlbums(0, 100)
-	}
+	albums, err := pageSynology("owned albums", synologyAlbumPageSize, synologyMaxAlbumPages,
+		func(offset, limit int) ([]synology.Album, error) {
+			gen := s.loginGeneration()
+			page, err := s.client.ListAlbums(offset, limit)
+			if s.isAuthExpired(err) {
+				if reErr := s.relogin(gen); reErr != nil {
+					return nil, errors.New("authentication expired and re-login failed: " + reErr.Error())
+				}
+				page, err = s.client.ListAlbums(offset, limit)
+			}
+			return page, err
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -310,15 +347,18 @@ func (s *SynologyService) ListAlbums() ([]synology.Album, error) {
 // get its owned albums, so a failure here is logged and swallowed rather than
 // failing the whole listing. See issue #52.
 func (s *SynologyService) listSharedAlbums(owned []synology.Album) []synology.Album {
-	gen := s.loginGeneration()
-	shared, err := s.client.ListSharedWithMeAlbums(0, 100)
-	if s.isAuthExpired(err) {
-		if reErr := s.relogin(gen); reErr != nil {
-			log.Printf("synology: re-login while listing shared albums: %v", reErr)
-			return nil
-		}
-		shared, err = s.client.ListSharedWithMeAlbums(0, 100)
-	}
+	shared, err := pageSynology("shared albums", synologyAlbumPageSize, synologyMaxAlbumPages,
+		func(offset, limit int) ([]synology.Album, error) {
+			gen := s.loginGeneration()
+			page, err := s.client.ListSharedWithMeAlbums(offset, limit)
+			if s.isAuthExpired(err) {
+				if reErr := s.relogin(gen); reErr != nil {
+					return nil, errors.New("re-login failed: " + reErr.Error())
+				}
+				page, err = s.client.ListSharedWithMeAlbums(offset, limit)
+			}
+			return page, err
+		})
 	if err != nil {
 		log.Printf("synology: could not list shared albums (owned albums still listed): %v", err)
 		return nil
@@ -372,28 +412,21 @@ func (s *SynologyService) FetchAlbumAssets(album model.Album) ([]RemoteAsset, er
 	ref := synology.AlbumRef{ID: albumID, Passphrase: album.SharePassphrase}
 
 	// Page through the album over the network.
-	var photos []synology.Item
-	offset, limit := 0, 500
-	for offset < 5000 {
-		gen := s.loginGeneration()
-		batch, e := s.client.ListPhotos(offset, limit, ref)
-		if s.isAuthExpired(e) {
-			if reErr := s.relogin(gen); reErr != nil {
-				return nil, reErr
+	photos, err := pageSynology("album "+album.ExternalID+" photos",
+		synologyPhotoPageSize, synologyMaxAlbumPhotos/synologyPhotoPageSize,
+		func(offset, limit int) ([]synology.Item, error) {
+			gen := s.loginGeneration()
+			batch, e := s.client.ListPhotos(offset, limit, ref)
+			if s.isAuthExpired(e) {
+				if reErr := s.relogin(gen); reErr != nil {
+					return nil, reErr
+				}
+				batch, e = s.client.ListPhotos(offset, limit, ref)
 			}
-			batch, e = s.client.ListPhotos(offset, limit, ref)
-		}
-		if e != nil {
-			return nil, e
-		}
-		if len(batch) == 0 {
-			break
-		}
-		photos = append(photos, batch...)
-		if len(batch) < limit {
-			break
-		}
-		offset += limit
+			return batch, e
+		})
+	if err != nil {
+		return nil, err
 	}
 
 	// Synology omits resolution for some items (reported as 0x0), which
